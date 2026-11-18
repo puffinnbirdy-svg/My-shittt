@@ -1,0 +1,870 @@
+--!nocheck
+-- Elytra-Mace Combo — Standalone GUI
+-- R = start/cancel  •  Y = hard-cancel
+-- Mace equipped ONLY at smash tick.
+-- Double jump auto-fires firework. Camera bobs up 1s / down 1s.
+-- Chestplate swaps 0.5s after down-phase begins.
+-- Sticky target: camera snaps INSTANTLY onto the target every tick until death.
+-- SMASH triggers at 1.5 studs of fall distance.
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local MC_Client     = PlayerScripts:WaitForChild("MC")
+local MC_Shared     = ReplicatedStorage:WaitForChild("MC")
+
+local Config          = require(MC_Shared.Config)
+local Items           = require(MC_Shared.Items)
+local Combat          = require(MC_Shared.Combat)
+local Net             = require(MC_Client.Net)
+local Controller      = require(MC_Client.Controller)
+local Hands           = require(MC_Client.Hands)
+local World           = require(MC_Client.World)
+local Input           = require(MC_Client.Input)
+local InventoryScreen = require(MC_Client.InventoryScreen)
+
+local BLOCK = Config.BLOCK
+
+-------------------------------------------------------------------------------
+-- Config
+-------------------------------------------------------------------------------
+local CFG = {
+    Range         = 32,
+    DiveTrigger   = 5.0,
+    Keybind       = Enum.KeyCode.R,
+    CancelKey     = Enum.KeyCode.Y,
+    LookUpPitch   = 1.30,
+    LookDownPitch = -0.90,
+    BobDuration   = 1.0,
+    DownSwapDelay = 0.5,
+    SmashFall     = 1.5,     -- smash at 1.5 studs of fall
+}
+
+-------------------------------------------------------------------------------
+-- Upvalue extraction
+-------------------------------------------------------------------------------
+local origRayBox = World.rayBox
+pcall(function()
+    for _ = 1, 5 do
+        if debug.info(World.rayBox, "s") == "" then
+            for i = 1, 5 do
+                local ok, upv = pcall(debug.getupvalue, World.rayBox, i)
+                if ok and type(upv) == "function" then
+                    World.rayBox = upv
+                    break
+                end
+            end
+        else
+            break
+        end
+    end
+end)
+origRayBox = World.rayBox
+
+local u116_queue, u224_targets = nil, nil
+pcall(function()
+    for _, btFn in ipairs(Controller.beforeTick) do
+        if type(btFn) == "function" and debug.info(btFn, "s"):find("Hands") then
+            local ok1, q = pcall(debug.getupvalue, btFn, 1)
+            if ok1 and type(q) == "table" and q.attacks ~= nil then
+                u116_queue = q
+                local ok6, attackFn = pcall(debug.getupvalue, btFn, 6)
+                if ok6 and type(attackFn) == "function" then
+                    local okT, tQueue = pcall(debug.getupvalue, attackFn, 1)
+                    if okT and type(tQueue) == "table" then
+                        u224_targets = tQueue
+                    end
+                end
+                break
+            end
+        end
+    end
+end)
+
+-------------------------------------------------------------------------------
+-- State
+-------------------------------------------------------------------------------
+local State = {
+    Active       = false,
+    Stage        = "idle",
+    Target       = nil,
+    TargetName   = "",
+    StageTick    = 0,
+    JumpRel      = nil,
+    SavedYaw     = nil,
+    SavedPitch   = nil,
+    LastResult   = "",
+    Jump1Done    = false,
+    Jump2Done    = false,
+    Jump2At      = 0,
+    FireworkSlot = nil,
+    BobStart     = 0,
+    DownStart    = 0,
+}
+
+-------------------------------------------------------------------------------
+-- Helpers
+-------------------------------------------------------------------------------
+local function isAlive()
+    if Workspace:GetAttribute("JugHold") == true then return false end
+    local char = LocalPlayer.Character
+    return Controller.state ~= nil and char ~= nil and char:GetAttribute("Alive") == true
+end
+
+local function isTargetAlive(target)
+    if not target or not target.model then return false end
+    if not target.model.Parent then return false end
+    local alive = target.model:GetAttribute("Alive")
+    if alive == false then return false end
+    local hp = target.model:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return false end
+    return true
+end
+
+local function isAirborne(state)
+    if not state then return false end
+    if state.onGround == false then return true end
+    if state.vel and state.vel.Y and state.vel.Y > 0.1 then return true end
+    return false
+end
+
+local function findHotbarSlot(pred)
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it and pred(it) then return i, it end
+    end
+    return nil, nil
+end
+
+local function getBestMaceSlot(fallDist)
+    local anyMace, density, breach = nil, nil, nil
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it and it.id == "mace" then
+            anyMace = anyMace or i
+            if it.ench then
+                if (it.ench.density or 0) > 0 or (it.ench.wind_burst or 0) > 0 then
+                    density = density or i
+                end
+                if (it.ench.breach or 0) > 0 then
+                    breach = breach or i
+                end
+            end
+        end
+    end
+    if fallDist > 5.5 then
+        return density or breach or anyMace
+    end
+    return breach or density or anyMace
+end
+
+local function findFireworkSlot()
+    return findHotbarSlot(function(it)
+        if not it.id then return false end
+        local id = it.id:lower()
+        return id == "firework_rocket" or id == "firework" or string.find(id, "firework") ~= nil
+    end)
+end
+
+local function getBestAimPointAndAngles(eyePos, target)
+    local width  = target.width  or Config.WIDTH
+    local height = target.height or Config.HEIGHT
+    local halfW  = (width * 0.5) * 0.80
+    local minB = Vector3.new(target.feet.X - halfW, target.feet.Y + 0.08,       target.feet.Z - halfW)
+    local maxB = Vector3.new(target.feet.X + halfW, target.feet.Y + height - 0.08, target.feet.Z + halfW)
+    local closestPt = Vector3.new(
+        math.clamp(eyePos.X, minB.X, maxB.X),
+        math.clamp(eyePos.Y, minB.Y, maxB.Y),
+        math.clamp(eyePos.Z, minB.Z, maxB.Z)
+    )
+    local centerPt = target.feet + Vector3.new(0, height * 0.5, 0)
+    local aimPt    = closestPt:Lerp(centerPt, 0.25)
+    local delta    = aimPt - eyePos
+    if delta.Magnitude < 1e-5 then
+        return Controller.look(), Controller.yaw, Controller.pitch
+    end
+    local u = delta.Unit
+    local yaw   = math.atan2(-u.X, -u.Z)
+    local pitch = math.asin(math.clamp(u.Y, -0.999, 0.999))
+    return u, yaw, pitch
+end
+
+local function getClosestTarget(maxReach, fovDeg)
+    local state = Controller.state
+    local eye   = Controller.eye()
+    if not state or not eye then return nil end
+    local myLook  = Controller.look()
+    local cosHalf = math.cos(math.rad((fovDeg or 360) * 0.5))
+    local best, bestDist = nil, maxReach
+    for _, t in ipairs(World.targets()) do
+        local aimDir = getBestAimPointAndAngles(eye, t)
+        if (fovDeg or 360) >= 359 or myLook:Dot(aimDir) >= cosHalf then
+            local hitDist = origRayBox(eye, aimDir, t.feet, t.height, 0, t.width)
+            if hitDist and hitDist <= bestDist then
+                local wall = World.blockRay(eye, aimDir, hitDist, {"Solid"})
+                if not wall or wall.dist >= hitDist then
+                    best, bestDist = t, hitDist
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function swapChestArmor(wantElytra, hotbarOnly)
+    local lastSwap = State._lastArmorSwap or 0
+    if not isAlive() or Controller.tickCount - lastSwap < 5 then return false end
+
+    local curChest    = Hands.inv.armor and Hands.inv.armor.chest
+    local curIsElytra = curChest and curChest.id == "elytra"
+    if wantElytra ~= nil and curIsElytra == wantElytra then return false end
+
+    local targetSlot, where = nil, nil
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it then
+            if wantElytra == true and it.id == "elytra" then
+                targetSlot, where = i, "hotbar"; break
+            elseif wantElytra == false then
+                local def = Items.def(it)
+                if def and def.kind == "armor" and def.slot == "chest" then
+                    targetSlot, where = i, "hotbar"; break
+                end
+            end
+        end
+    end
+    if not targetSlot and not hotbarOnly then
+        for k, it in pairs(Hands.inv.inventory) do
+            if type(k) == "number" and it then
+                if wantElytra == true and it.id == "elytra" then
+                    targetSlot, where = k + 10, "inventory"; break
+                elseif wantElytra == false then
+                    local def = Items.def(it)
+                    if def and def.kind == "armor" and def.slot == "chest" then
+                        targetSlot, where = k + 10, "inventory"; break
+                    end
+                end
+            end
+        end
+    end
+    if not targetSlot then return false end
+    if hotbarOnly and where ~= "hotbar" then return false end
+
+    State._lastArmorSwap = Controller.tickCount
+
+    if where == "hotbar" and u116_queue then
+        u116_queue.select = targetSlot
+        u116_queue.uses   = (u116_queue.uses or 0) + 1
+        return true
+    else
+        local wasOpen = false
+        pcall(function() wasOpen = InventoryScreen.isOpen() end)
+        if not wasOpen then Net.send({a = "inv", op = "open"}) end
+        Net.send({a = "inv", op = "click", slot = targetSlot, shift = false, right = false})
+        Net.send({a = "inv", op = "click", slot = 102,       shift = false, right = false})
+        Net.send({a = "inv", op = "click", slot = targetSlot, shift = false, right = false})
+        if not wasOpen then Net.send({a = "inv", op = "close"}) end
+        return true
+    end
+end
+
+local function queueNativeMaceSmash(target)
+    if not isTargetAlive(target) then return false end
+    local state = Controller.state
+    local eye   = Controller.eye()
+    if not state or not eye or not u116_queue then return false end
+
+    local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, target)
+    local maceSlot = getBestMaceSlot(state.fallDistance or 0)
+    if not maceSlot then return false end
+
+    State.SavedYaw   = State.SavedYaw   or Controller.yaw
+    State.SavedPitch = State.SavedPitch or Controller.pitch
+    Controller.yaw   = aimYaw
+    Controller.pitch = aimPitch
+
+    u116_queue.select = maceSlot
+    u116_queue.attacks = 1
+    if u224_targets then
+        table.clear(u224_targets)
+        table.insert(u224_targets, { look = Controller.look(), target = target })
+    end
+    return true
+end
+
+-- ▶ INSTANT locks (no smoothing)
+local function snapLockTo(yaw, pitch)
+    Controller.yaw   = yaw
+    Controller.pitch = math.clamp(pitch, -1.52, 1.52)
+end
+
+local function lockYawToTarget()
+    if not State.Target then return end
+    local eye = Controller.eye()
+    if not eye then return end
+    local _, yaw = getBestAimPointAndAngles(eye, State.Target)
+    Controller.yaw = yaw
+end
+
+local function pressJump()
+    pcall(Input.setVirtual, "jump", true)
+    State.JumpRel = Controller.tickCount + 1
+end
+
+local function stopCombo(msg)
+    if State.SavedYaw then
+        Controller.yaw = State.SavedYaw
+        State.SavedYaw = nil
+    end
+    if State.SavedPitch then
+        Controller.pitch = State.SavedPitch
+        State.SavedPitch = nil
+    end
+    State.Active       = false
+    State.Stage        = "idle"
+    State.Target       = nil
+    State.TargetName   = ""
+    State.StageTick    = 0
+    State.JumpRel      = nil
+    State.Jump1Done    = false
+    State.Jump2Done    = false
+    State.Jump2At      = 0
+    State.FireworkSlot = nil
+    State.BobStart     = 0
+    State.DownStart    = 0
+    if msg then State.LastResult = msg end
+    if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+end
+
+local function startCombo()
+    if State.Active then
+        stopCombo("Cancelled")
+        return
+    end
+    if not isAlive() then
+        State.LastResult = "Not alive"
+        if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+        return
+    end
+    if not u116_queue then
+        State.LastResult = "Queue not found"
+        if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+        return
+    end
+    if not getBestMaceSlot(10) then
+        State.LastResult = "No mace in hotbar"
+        if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+        return
+    end
+
+    State.Active       = true
+    State.Stage        = "locking"
+    State.Target       = nil
+    State.TargetName   = ""
+    State.StageTick    = 0
+    State.SavedYaw     = Controller.yaw
+    State.SavedPitch   = Controller.pitch
+    State.LastResult   = ""
+    State.Jump1Done    = false
+    State.Jump2Done    = false
+    State.Jump2At      = 0
+    State.FireworkSlot = findFireworkSlot()
+    State.BobStart     = 0
+    State.DownStart    = 0
+end
+
+-------------------------------------------------------------------------------
+-- Stage machine
+-------------------------------------------------------------------------------
+local function onPreTick(state)
+    if State.JumpRel and Controller.tickCount >= State.JumpRel then
+        pcall(Input.setVirtual, "jump", false)
+        State.JumpRel = nil
+    end
+
+    if not State.Active then return end
+    if not state or not isAlive() then stopCombo("Died") return end
+    if not u116_queue then stopCombo("Queue lost") return end
+
+    if State.Target and not isTargetAlive(State.Target) then
+        stopCombo("Target died: " .. State.TargetName)
+        return
+    end
+
+    -- Instant yaw snap every tick during jump & rocket
+    if State.Target and (State.Stage == "jump" or State.Stage == "rocket") then
+        lockYawToTarget()
+    end
+
+    State.StageTick = State.StageTick + 1
+    local tick = State.StageTick
+
+    -- ── LOCKING (instant — transitions in 1 tick) ────────────────────
+    if State.Stage == "locking" then
+        local target = getClosestTarget(CFG.Range, 360)
+        if not target then
+            if tick > 40 then stopCombo("No target") end
+            return
+        end
+        State.Target     = target
+        State.TargetName = tostring(target.model:GetAttribute("DisplayName") or target.model.Name)
+
+        local eye = Controller.eye()
+        if not eye then stopCombo("No eye") return end
+        local _, yaw, pitch = getBestAimPointAndAngles(eye, target)
+        snapLockTo(yaw, pitch)
+
+        State.Stage     = "jump"
+        State.StageTick = 0
+
+    -- ── JUMP + AUTO FIREWORK ─────────────────────────────────────────
+    elseif State.Stage == "jump" then
+        if tick == 1 then
+            if not swapChestArmor(true, true) then
+                stopCombo("No elytra in hotbar")
+                return
+            end
+            State.Jump1Done    = false
+            State.Jump2Done    = false
+            State.Jump2At      = 0
+            State.FireworkSlot = findFireworkSlot()
+
+        elseif tick >= 3 and tick <= 45 then
+            if state.gliding then
+                Controller.pitch = CFG.LookUpPitch
+                if State.FireworkSlot then
+                    u116_queue.select = State.FireworkSlot
+                    State.Stage     = "rocket"
+                    State.StageTick = 0
+                else
+                    State.Stage     = "dive"
+                    State.StageTick = 0
+                    State.BobStart  = os.clock()
+                end
+                return
+            end
+
+            if State.JumpRel then return end
+
+            if not State.Jump1Done then
+                local chest = Hands.inv.armor and Hands.inv.armor.chest
+                if chest and chest.id == "elytra" and state.onGround then
+                    pressJump()
+                    State.Jump1Done = true
+                end
+            elseif not State.Jump2Done then
+                if isAirborne(state) then
+                    pressJump()
+                    State.Jump2Done = true
+                    State.Jump2At   = Controller.tickCount
+                end
+            else
+                if isAirborne(state) and (Controller.tickCount - State.Jump2At) > 3 then
+                    pressJump()
+                    State.Jump2At = Controller.tickCount
+                end
+            end
+
+        elseif tick > 45 then
+            stopCombo("Failed to glide")
+        end
+
+    -- ── ROCKET ───────────────────────────────────────────────────────
+    elseif State.Stage == "rocket" then
+        if tick == 1 then
+            Controller.pitch = CFG.LookUpPitch
+            u116_queue.attacks = 0
+            if u224_targets then table.clear(u224_targets) end
+            u116_queue.uses = 1
+            State.Stage     = "dive"
+            State.StageTick = 0
+            State.BobStart  = os.clock()
+        end
+
+    -- ── DIVE (instant bob — snaps up/down) ──────────────────────────
+    elseif State.Stage == "dive" then
+        local eye = Controller.eye()
+        if not eye then stopCombo("No eye") return end
+
+        local _, yaw = getBestAimPointAndAngles(eye, State.Target)
+        local elapsed     = os.clock() - State.BobStart
+        local phase       = math.floor(elapsed / CFG.BobDuration) % 2
+        local targetPitch = (phase == 0) and CFG.LookUpPitch or CFG.LookDownPitch
+        snapLockTo(yaw, targetPitch)
+
+        if phase == 1 then
+            if State.DownStart == 0 then
+                State.DownStart = os.clock()
+            end
+        else
+            State.DownStart = 0
+        end
+
+        local dist = (State.Target.feet - state.pos).Magnitude
+        local swapNow = (phase == 1 and State.DownStart > 0
+                         and (os.clock() - State.DownStart) >= CFG.DownSwapDelay)
+                        or dist < CFG.DiveTrigger
+
+        if swapNow then
+            if swapChestArmor(false, true) then
+                State.Stage     = "falling"
+                State.StageTick = 0
+            end
+        elseif tick > 120 then
+            stopCombo("Dive timeout")
+        end
+
+    -- ── FALLING (instant lock, smash at 1.5 studs) ──────────────────
+    elseif State.Stage == "falling" then
+        local eye = Controller.eye()
+        if eye then
+            local _, yaw, pitch = getBestAimPointAndAngles(eye, State.Target)
+            snapLockTo(yaw, pitch)
+        end
+
+        if (state.fallDistance or 0) >= CFG.SmashFall and not state.gliding then
+            State.Stage     = "smash"
+            State.StageTick = 0
+        elseif tick > 40 then
+            stopCombo("Fall timeout")
+        end
+
+    -- ── SMASH ────────────────────────────────────────────────────────
+    elseif State.Stage == "smash" then
+        if queueNativeMaceSmash(State.Target) then
+            State.Stage     = "recover"
+            State.StageTick = 0
+        else
+            stopCombo("Smash failed")
+        end
+
+    -- ── RECOVER (instant snap back, 2 ticks) ────────────────────────
+    elseif State.Stage == "recover" then
+        if State.SavedYaw then
+            Controller.yaw   = State.SavedYaw
+            Controller.pitch = State.SavedPitch
+        end
+        if tick > 2 then
+            stopCombo("Combo complete")
+        end
+    end
+
+    if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+end
+
+table.insert(Controller.beforeTick, 1, onPreTick)
+
+-------------------------------------------------------------------------------
+-- GUI
+-------------------------------------------------------------------------------
+local Accent = Color3.fromRGB(225, 48, 58)
+local Bg     = Color3.fromRGB(24, 16, 18)
+local Card   = Color3.fromRGB(34, 22, 26)
+local Fg     = Color3.fromRGB(240, 235, 240)
+local Dim    = Color3.fromRGB(150, 130, 140)
+local Off    = Color3.fromRGB(50, 30, 34)
+local Warn   = Color3.fromRGB(240, 200, 90)
+
+local function guiContainer()
+    if typeof(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then return hui end
+    end
+    local ok, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok and core then return core end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "ElytraMaceComboGUI"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder   = 100
+ScreenGui.Parent         = guiContainer()
+
+local Main = Instance.new("Frame")
+Main.Size             = UDim2.fromOffset(288, 368)
+Main.Position         = UDim2.new(0, 20, 0.5, -184)
+Main.BackgroundColor3 = Bg
+Main.BorderSizePixel  = 0
+Main.Active           = true
+Main.Parent           = ScreenGui
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 8)
+
+local Stroke = Instance.new("UIStroke", Main)
+Stroke.Color     = Color3.fromRGB(80, 40, 44)
+Stroke.Thickness = 1
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Size             = UDim2.new(1, 0, 0, 34)
+TitleBar.BackgroundColor3 = Card
+TitleBar.BorderSizePixel  = 0
+TitleBar.Parent           = Main
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 8)
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size                = UDim2.new(1, -50, 1, 0)
+TitleText.Position            = UDim2.fromOffset(12, 0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text                = "Elytra Mace Combo"
+TitleText.TextColor3          = Fg
+TitleText.Font                = Enum.Font.GothamBold
+TitleText.TextSize            = 13
+TitleText.TextXAlignment      = Enum.TextXAlignment.Left
+TitleText.Parent              = TitleBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size             = UDim2.fromOffset(22, 22)
+CloseBtn.Position         = UDim2.new(1, -28, 0, 6)
+CloseBtn.BackgroundColor3 = Accent
+CloseBtn.Text             = "X"
+CloseBtn.TextColor3       = Fg
+CloseBtn.Font             = Enum.Font.GothamBold
+CloseBtn.TextSize         = 11
+CloseBtn.AutoButtonColor  = false
+CloseBtn.BorderSizePixel  = 0
+CloseBtn.Parent           = TitleBar
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+
+local StatusFrame = Instance.new("Frame")
+StatusFrame.Size             = UDim2.new(1, -16, 0, 54)
+StatusFrame.Position         = UDim2.fromOffset(8, 42)
+StatusFrame.BackgroundColor3 = Card
+StatusFrame.BorderSizePixel  = 0
+StatusFrame.Parent           = Main
+Instance.new("UICorner", StatusFrame).CornerRadius = UDim.new(0, 6)
+
+local StageLbl = Instance.new("TextLabel")
+StageLbl.Size                = UDim2.new(1, -16, 0, 20)
+StageLbl.Position            = UDim2.fromOffset(8, 6)
+StageLbl.BackgroundTransparency = 1
+StageLbl.Text                = "Idle"
+StageLbl.TextColor3          = Fg
+StageLbl.Font                = Enum.Font.GothamBold
+StageLbl.TextSize            = 13
+StageLbl.TextXAlignment      = Enum.TextXAlignment.Left
+StageLbl.Parent              = StatusFrame
+
+local SubLbl = Instance.new("TextLabel")
+SubLbl.Size                = UDim2.new(1, -16, 0, 20)
+SubLbl.Position            = UDim2.fromOffset(8, 26)
+SubLbl.BackgroundTransparency = 1
+SubLbl.Text                = "R to start • Y to cancel"
+SubLbl.TextColor3          = Dim
+SubLbl.Font                = Enum.Font.Gotham
+SubLbl.TextSize            = 11
+SubLbl.TextXAlignment      = Enum.TextXAlignment.Left
+SubLbl.Parent              = StatusFrame
+
+local StartBtn = Instance.new("TextButton")
+StartBtn.Size             = UDim2.new(1, -16, 0, 42)
+StartBtn.Position         = UDim2.fromOffset(8, 104)
+StartBtn.BackgroundColor3 = Accent
+StartBtn.Text             = "START  (R)"
+StartBtn.TextColor3       = Fg
+StartBtn.Font             = Enum.Font.GothamBold
+StartBtn.TextSize         = 14
+StartBtn.AutoButtonColor  = false
+StartBtn.BorderSizePixel  = 0
+StartBtn.Parent           = Main
+Instance.new("UICorner", StartBtn).CornerRadius = UDim.new(0, 6)
+
+local function makeSlider(order, label, min, max, default, onChanged)
+    local frame = Instance.new("Frame")
+    frame.Size             = UDim2.new(1, -16, 0, 40)
+    frame.Position         = UDim2.fromOffset(8, 154 + (order - 1) * 46)
+    frame.BackgroundColor3 = Card
+    frame.BorderSizePixel  = 0
+    frame.Parent           = Main
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 5)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size                = UDim2.new(1, -80, 0, 16)
+    lbl.Position            = UDim2.fromOffset(8, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Text                = label
+    lbl.TextColor3          = Fg
+    lbl.Font                = Enum.Font.GothamBold
+    lbl.TextSize            = 11
+    lbl.TextXAlignment      = Enum.TextXAlignment.Left
+    lbl.Parent              = frame
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size                = UDim2.fromOffset(60, 16)
+    valLbl.Position            = UDim2.new(1, -68, 0, 4)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text                = string.format("%.0f", default)
+    valLbl.TextColor3          = Accent
+    valLbl.Font                = Enum.Font.GothamBold
+    valLbl.TextSize            = 11
+    valLbl.TextXAlignment      = Enum.TextXAlignment.Right
+    valLbl.Parent              = frame
+
+    local track = Instance.new("TextButton")
+    track.Size             = UDim2.new(1, -16, 0, 8)
+    track.Position         = UDim2.fromOffset(8, 26)
+    track.BackgroundColor3 = Off
+    track.Text             = ""
+    track.AutoButtonColor  = false
+    track.BorderSizePixel  = 0
+    track.Parent           = frame
+    Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+    local fill = Instance.new("Frame")
+    fill.Size             = UDim2.new((default - min) / (max - min), 0, 1, 0)
+    fill.BackgroundColor3 = Accent
+    fill.BorderSizePixel  = 0
+    fill.Parent           = track
+    Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+    local dragging = false
+    local function setVal(v)
+        v = math.clamp(v, min, max)
+        fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+        valLbl.Text = string.format("%.0f", v)
+        if onChanged then onChanged(v) end
+    end
+
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            local px = input.Position.X - track.AbsolutePosition.X
+            setVal(min + (px / track.AbsoluteSize.X) * (max - min))
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local px = input.Position.X - track.AbsolutePosition.X
+            setVal(min + (px / track.AbsoluteSize.X) * (max - min))
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+end
+
+makeSlider(1, "Target Range", 10, 80, CFG.Range, function(v) CFG.Range = v end)
+
+local Hint = Instance.new("TextLabel")
+Hint.Size                = UDim2.new(1, -16, 0, 16)
+Hint.Position            = UDim2.new(0, 8, 1, -22)
+Hint.BackgroundTransparency = 1
+Hint.Text                = "Drag title bar to move"
+Hint.TextColor3          = Dim
+Hint.Font                = Enum.Font.Gotham
+Hint.TextSize            = 10
+Hint.TextXAlignment      = Enum.TextXAlignment.Center
+Hint.Parent              = Main
+
+local dragging, dragStart, startPos = false, nil, nil
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        dragStart = input.Position
+        startPos  = Main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local delta = input.Position - dragStart
+    Main.Position = UDim2.new(
+        startPos.X.Scale, startPos.X.Offset + delta.X,
+        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+    )
+end)
+
+local Pill = Instance.new("TextButton")
+Pill.Name             = "Reopen"
+Pill.Size             = UDim2.fromOffset(130, 26)
+Pill.Position         = UDim2.new(0, 16, 0, 16)
+Pill.BackgroundColor3 = Accent
+Pill.Text             = "ElytraMace (show)"
+Pill.TextColor3       = Fg
+Pill.Font             = Enum.Font.GothamBold
+Pill.TextSize         = 11
+Pill.AutoButtonColor  = false
+Pill.BorderSizePixel  = 0
+Pill.Visible          = false
+Pill.Parent           = ScreenGui
+Instance.new("UICorner", Pill).CornerRadius = UDim.new(0, 6)
+
+Pill.MouseButton1Click:Connect(function() Main.Visible = true; Pill.Visible = false end)
+CloseBtn.MouseButton1Click:Connect(function() Main.Visible = false; Pill.Visible = true end)
+
+GUI = {}
+function GUI.UpdateStatus()
+    local stage = State.Stage
+    if stage == "locking" then
+        StageLbl.Text = "Locking target..."
+    elseif stage == "jump" then
+        StageLbl.Text = "Equipping elytra + jumping"
+    elseif stage == "rocket" then
+        StageLbl.Text = "FIRING FIREWORK"
+    elseif stage == "dive" then
+        local elapsed = os.clock() - State.BobStart
+        local phase   = math.floor(elapsed / CFG.BobDuration) % 2
+        if phase == 0 then
+            StageLbl.Text = "Climbing  ↑ looking up"
+        else
+            local wait = State.DownStart > 0
+                and (CFG.DownSwapDelay - (os.clock() - State.DownStart))
+                or CFG.DownSwapDelay
+            StageLbl.Text = string.format("Committing  ↓  (%.1fs)", math.max(0, wait))
+        end
+    elseif stage == "falling" then
+        StageLbl.Text = "Falling (awaiting smash)"
+    elseif stage == "smash" then
+        StageLbl.Text = "MACE SMASH"
+    elseif stage == "recover" then
+        StageLbl.Text = "Finishing"
+    else
+        StageLbl.Text = "Idle"
+    end
+    StageLbl.TextColor3 = State.Active and Accent or Fg
+
+    if State.LastResult ~= "" then
+        SubLbl.Text = State.LastResult
+        SubLbl.TextColor3 = State.Active and Warn or Dim
+    elseif State.Active and State.TargetName ~= "" then
+        SubLbl.Text = "Target: " .. State.TargetName
+        SubLbl.TextColor3 = Dim
+    else
+        SubLbl.Text = State.Active and "Combo running..." or "R to start • Y to cancel"
+        SubLbl.TextColor3 = Dim
+    end
+
+    StartBtn.Text = State.Active and "CANCEL  (Y)" or "START  (R)"
+    StartBtn.BackgroundColor3 = State.Active and Warn or Accent
+end
+
+StartBtn.MouseButton1Click:Connect(startCombo)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe and UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == CFG.Keybind then
+        startCombo()
+    elseif input.KeyCode == CFG.CancelKey then
+        if State.Active then stopCombo("Cancelled") end
+    end
+end)
+
+GUI.UpdateStatus()
+print("[ElytraMace] Loaded — queue:" .. tostring(u116_queue ~= nil) ..
+      " targets:" .. tostring(u224_targets ~= nil))
