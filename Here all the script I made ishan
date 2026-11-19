@@ -1,0 +1,888 @@
+-- Standalone Sword -> Breach Mace -> Sword Swap
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local MC_Client     = PlayerScripts:WaitForChild("MC")
+local MC_Shared     = ReplicatedStorage:WaitForChild("MC")
+
+local Items      = require(MC_Shared.Items)
+local Combat     = require(MC_Shared.Combat)
+local Controller = require(MC_Client.Controller)
+local Hands      = require(MC_Client.Hands)
+
+-- ── Find Attack Queue & Hands Index ────────────────────────────────────
+local u116_queue = nil
+local handsIndex = nil
+
+pcall(function()
+    for i, fn in ipairs(Controller.beforeTick) do
+        if type(fn) == "function" and debug.info(fn, "s"):find("Hands") then
+            local ok, q = pcall(debug.getupvalue, fn, 1)
+            if ok and type(q) == "table" and q.attacks ~= nil then
+                u116_queue = q
+                handsIndex = i
+                break
+            end
+        end
+    end
+end)
+
+if not u116_queue then
+    warn("[BreachSwap] Could not find Mourier attack queue. Is the client loaded?")
+    return
+end
+
+-- ── State & Config ─────────────────────────────────────────────────────
+local Cfg = {
+    BreachSwap = false,
+    MinCharge = 0.85
+}
+
+local pendingRestoreSlot = nil
+local pendingRestoreTick = 0
+
+-- ── Helpers ────────────────────────────────────────────────────────────
+local function isAlive()
+    if Workspace:GetAttribute("JugHold") == true then return false end
+    local char = LocalPlayer.Character
+    return Controller.state ~= nil and char ~= nil and char:GetAttribute("Alive") == true
+end
+
+local function getBestBreachMaceSlot()
+    local bestSlot, bestScore = nil, -999
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it and it.id == "mace" then
+            local breachLvl = Items.ench(it, "breach") or 0
+            if breachLvl > 0 then
+                local wbLvl = Items.ench(it, "wind_burst") or 0
+                local score = breachLvl * 20 - wbLvl * 5
+                if score > bestScore then
+                    bestScore = score
+                    bestSlot = i
+                end
+            end
+        end
+    end
+    return bestSlot
+end
+
+-- Extracts the actual attack charge using the client's internal tracker
+local noteSwapFn = nil
+pcall(function()
+    local okNs, ns = pcall(debug.getupvalue, Hands.select, 2)
+    if okNs and type(ns) == "function" then
+        noteSwapFn = ns
+    end
+end)
+
+local function getEffectiveAttackStrength()
+    if noteSwapFn then
+        local ok1, u95 = pcall(debug.getupvalue, noteSwapFn, 1)
+        local ok3, u96 = pcall(debug.getupvalue, noteSwapFn, 3)
+        if ok1 and ok3 and type(u96) == "table" and (Controller.tickCount - (tonumber(u95) or -99)) <= 1 then
+            local def = u96.item and Items.def(u96.item)
+            return Combat.strength(Controller.tickCount - (u96.reset or 0), def and def.speed or 4)
+        end
+    end
+    return Hands.strength(0)
+end
+
+-- ── Main Tick Logic ────────────────────────────────────────────────────
+local statusLbl -- Forward declaration for GUI debug
+
+local function stepBreachSwap()
+    if not isAlive() then return end
+
+    -- 1. Handle Swapping Back to Sword
+    if pendingRestoreSlot and Controller.tickCount >= pendingRestoreTick then
+        if not u116_queue.select and Hands.inv.selected ~= pendingRestoreSlot then
+            u116_queue.select = pendingRestoreSlot
+        end
+        pendingRestoreSlot = nil
+    end
+
+    -- 2. Handle Detecting Attack & Swapping to Mace
+    if Cfg.BreachSwap and u116_queue and (u116_queue.attacks or 0) > 0 then
+        if not u116_queue.select then
+            local held = Hands.held()
+            local heldDef = held and Items.def(held)
+            
+            if heldDef and heldDef.kind == "sword" then
+                local breachSlot = getBestBreachMaceSlot()
+                local origSlot = Hands.inv.selected
+                
+                if breachSlot then
+                    if breachSlot ~= origSlot then
+                        local charge = getEffectiveAttackStrength()
+                        if charge >= Cfg.MinCharge then
+                            -- DO THE SWAP
+                            u116_queue.select = breachSlot
+                            pendingRestoreSlot = origSlot
+                            pendingRestoreTick = Controller.tickCount + 1
+                            if statusLbl then statusLbl.Text = "Swapping to Mace!" end
+                        else
+                            if statusLbl then statusLbl.Text = string.format("Low Charge: %.2f", charge) end
+                        end
+                    else
+                        if statusLbl then statusLbl.Text = "Already holding Mace" end
+                    end
+                else
+                    if statusLbl then statusLbl.Text = "No Breach Mace in hotbar" end
+                end
+            else
+                if statusLbl then statusLbl.Text = "Not holding a Sword" end
+            end
+        end
+    else
+        if statusLbl and Cfg.BreachSwap then
+            statusLbl.Text = "Waiting for attack..."
+        end
+    end
+end
+
+-- Insert right before Hands so it catches the queue
+if handsIndex then
+    table.insert(Controller.beforeTick, handsIndex, stepBreachSwap)
+else
+    table.insert(Controller.beforeTick, 1, stepBreachSwap)
+end
+
+-- ── GUI ────────────────────────────────────────────────────────────────
+local pg  = LocalPlayer:WaitForChild("PlayerGui")
+local old = pg:FindFirstChild("BreachSwapGui")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "BreachSwapGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = pg
+
+local frame = Instance.new("Frame")
+frame.Position = UDim2.new(0.5, -100, 0, 200) 
+frame.Size = UDim2.fromOffset(200, 115)
+frame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+frame.BackgroundTransparency = 0.15
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local stroke = Instance.new("UIStroke", frame)
+stroke.Thickness = 1.4
+stroke.Color = Color3.fromRGB(165, 95, 255)
+stroke.Transparency = 0.2
+stroke.Parent = frame
+
+local title = Instance.new("TextLabel", frame)
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(0, 4)
+title.Size = UDim2.new(1, 0, 0, 20)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextColor3 = Color3.fromRGB(245, 245, 255)
+title.Text = "SWORD BREACH SWAP"
+title.Parent = frame
+
+local btn = Instance.new("TextButton", frame)
+btn.Position = UDim2.fromOffset(10, 28)
+btn.Size = UDim2.new(1, -20, 0, 36)
+btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+btn.BorderSizePixel = 0
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 13
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Text = "SWAP: OFF"
+btn.Parent = frame
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+statusLbl = Instance.new("TextLabel", frame)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Position = UDim2.fromOffset(0, 68)
+statusLbl.Size = UDim2.new(1, 0, 0, 20)
+statusLbl.Font = Enum.Font.Code
+statusLbl.TextSize = 10
+statusLbl.TextColor3 = Color3.fromRGB(180, 180, 200)
+statusLbl.Text = "Disabled"
+statusLbl.Parent = frame
+
+-- Toggle Logic
+btn.MouseButton1Click:Connect(function()
+    Cfg.BreachSwap = not Cfg.BreachSwap
+    if Cfg.BreachSwap then
+        btn.Text = "SWAP: ON"
+        btn.BackgroundColor3 = Color3.fromRGB(165, 95, 255)
+        statusLbl.Text = "Waiting for attack..."
+    else
+        btn.Text = "SWAP: OFF"
+        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+        statusLbl.Text = "Disabled"
+    end
+end)
+
+-- Drag Logic
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = frame.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+print("[BreachSwap] Loaded. Only triggers when holding a Sword.")
+
+
+
+
+
+-- Standalone Auto Destroy Cart (Camera Lock + Pass-through Manual Clicks)
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local MC_Client     = PlayerScripts:WaitForChild("MC")
+local MC_Shared     = ReplicatedStorage:WaitForChild("MC")
+
+local Config     = require(MC_Shared.Config)
+local Items      = require(MC_Shared.Items)
+local Controller = require(MC_Client.Controller)
+local Hands      = require(MC_Client.Hands)
+local World      = require(MC_Client.World)
+local BLOCK      = Config.BLOCK
+
+-- ── Find Attack Queue & Hands Index ────────────────────────────────────
+local u116_queue, u224_targets, handsIndex = nil, nil, nil
+pcall(function()
+    for i, fn in ipairs(Controller.beforeTick) do
+        if type(fn) == "function" and debug.info(fn, "s"):find("Hands") then
+            local ok, q = pcall(debug.getupvalue, fn, 1)
+            if ok and type(q) == "table" and q.attacks ~= nil then
+                u116_queue = q
+                handsIndex = i
+                local ok6, af = pcall(debug.getupvalue, fn, 6)
+                if ok6 and type(af) == "function" then
+                    local okT, tq = pcall(debug.getupvalue, af, 1)
+                    if okT and type(tq) == "table" then u224_targets = tq end
+                end
+                break
+            end
+        end
+    end
+end)
+
+if not u116_queue then
+    warn("[AutoCartDestroy] Could not find Mourier attack queue.")
+    return
+end
+
+-- ── State & Config ─────────────────────────────────────────────────────
+local Cfg = {
+    AutoDestroyCart = false
+}
+
+local lastAttackTick = 0
+
+-- ── Helpers ────────────────────────────────────────────────────────────
+local function isAlive()
+    if Workspace:GetAttribute("JugHold") == true then return false end
+    local char = LocalPlayer.Character
+    return Controller.state ~= nil and char ~= nil and char:GetAttribute("Alive") == true
+end
+
+local function getBestSwordSlot()
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it then
+            local def = Items.def(it)
+            if def and def.kind == "sword" then
+                return i
+            end
+        end
+    end
+    return nil
+end
+
+local function findNearestCartPivot(eyePos, maxReach)
+    local carts = World.folder and World.folder:FindFirstChild("Carts")
+    if not carts then return nil, nil end
+    local bestCart, bestPt, bestDist = nil, nil, maxReach or 4.5
+    for _, c in ipairs(carts:GetChildren()) do
+        if c:GetAttribute("CartId") and c:IsA("Model") then
+            local pt = (c:GetPivot().Position / BLOCK) + Vector3.new(0, 0.35, 0)
+            local d = (pt - eyePos).Magnitude
+            if d <= bestDist then
+                bestDist = d
+                bestCart = c
+                bestPt = pt
+            end
+        end
+    end
+    return bestCart, bestPt
+end
+
+-- ── Main Logic ─────────────────────────────────────────────────────────
+local statusLbl
+
+local function stepAutoDestroyCart()
+    if not Cfg.AutoDestroyCart or not isAlive() then return end
+
+    local eye = Controller.eye()
+    if not eye then return end
+
+    -- Look for a cart within 4.5 blocks
+    local cart, cartPt = findNearestCartPivot(eye, 4.5)
+    
+    if cartPt then
+        -- 1. Hard Lock Camera to the Cart
+        local delta = cartPt - eye
+        if delta.Magnitude > 0.1 then
+            local unit = delta.Unit
+            Controller.yaw = math.atan2(-unit.X, -unit.Z)
+            Controller.pitch = math.asin(math.clamp(unit.Y, -0.999, 0.999))
+        end
+
+        -- 2. Ensure we hold a Sword
+        local swSlot = getBestSwordSlot()
+        if swSlot and Hands.inv.selected ~= swSlot then
+            u116_queue.select = swSlot
+        end
+
+        -- 3. Swing (4 tick cooldown)
+        if Controller.tickCount - lastAttackTick >= 4 then
+            lastAttackTick = Controller.tickCount
+            if u224_targets then table.clear(u224_targets) end
+            u116_queue.attacks = 1
+            if statusLbl then statusLbl.Text = "Destroying Cart!" end
+        end
+    else
+        -- No cart found: Do absolutely nothing. 
+        -- This lets your manual mouse clicks pass through to the game normally.
+        if statusLbl and Cfg.AutoDestroyCart then 
+            statusLbl.Text = "Searching..." 
+        end
+    end
+end
+
+-- Insert right before Hands so it overrides inputs
+if handsIndex then
+    table.insert(Controller.beforeTick, handsIndex, stepAutoDestroyCart)
+else
+    table.insert(Controller.beforeTick, 1, stepAutoDestroyCart)
+end
+
+-- ── GUI ────────────────────────────────────────────────────────────────
+local pg  = LocalPlayer:WaitForChild("PlayerGui")
+local old = pg:FindFirstChild("AutoCartDestroyGui")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoCartDestroyGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = pg
+
+local frame = Instance.new("Frame")
+frame.Position = UDim2.new(0.5, -100, 0, 300) 
+frame.Size = UDim2.fromOffset(200, 115)
+frame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+frame.BackgroundTransparency = 0.15
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local stroke = Instance.new("UIStroke", frame)
+stroke.Thickness = 1.4
+stroke.Color = Color3.fromRGB(165, 95, 255)
+stroke.Transparency = 0.2
+stroke.Parent = frame
+
+local title = Instance.new("TextLabel", frame)
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(0, 4)
+title.Size = UDim2.new(1, 0, 0, 20)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextColor3 = Color3.fromRGB(245, 245, 255)
+title.Text = "AUTO DESTROY CART"
+title.Parent = frame
+
+local btn = Instance.new("TextButton", frame)
+btn.Position = UDim2.fromOffset(10, 28)
+btn.Size = UDim2.new(1, -20, 0, 36)
+btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+btn.BorderSizePixel = 0
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 13
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Text = "AUTO DESTROY: OFF"
+btn.Parent = frame
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+statusLbl = Instance.new("TextLabel", frame)
+statusLbl.BackgroundTransparency = 1
+statusLbl.Position = UDim2.fromOffset(0, 68)
+statusLbl.Size = UDim2.new(1, 0, 0, 20)
+statusLbl.Font = Enum.Font.Code
+statusLbl.TextSize = 10
+statusLbl.TextColor3 = Color3.fromRGB(180, 180, 200)
+statusLbl.Text = "Disabled"
+statusLbl.Parent = frame
+
+-- Toggle Logic
+btn.MouseButton1Click:Connect(function()
+    Cfg.AutoDestroyCart = not Cfg.AutoDestroyCart
+    if Cfg.AutoDestroyCart then
+        btn.Text = "AUTO DESTROY: ON"
+        btn.BackgroundColor3 = Color3.fromRGB(165, 95, 255)
+        statusLbl.Text = "Searching..."
+    else
+        btn.Text = "AUTO DESTROY: OFF"
+        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+        statusLbl.Text = "Disabled"
+    end
+end)
+
+-- Drag Logic
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = frame.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+print("[AutoCartDestroy] Loaded.")
+
+
+
+-- InstaCart.lua — 0.1s Delays + Fixed Auto-Aim Bow
+local Players           = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local MC_Client     = PlayerScripts:WaitForChild("MC")
+local MC_Shared     = ReplicatedStorage:WaitForChild("MC")
+
+local Config     = require(MC_Shared.Config)
+local Controller = require(MC_Client.Controller)
+local Hands      = require(MC_Client.Hands)
+local World      = require(MC_Client.World)
+local BLOCK      = Config.BLOCK
+
+local SETTINGS = {
+    StepDelay    = 0.1,    -- 2 ticks = 0.1 seconds
+    BowHoldTicks = 12,   -- Hold bow ~0.5s for full charge
+    EquipTimeout = 30,
+    MaxJobTicks  = 120,
+}
+
+-- ── Find Queues ────────────────────────────────────────────────────────
+local u116_queue, u224_targets, handsIndex = nil, nil, nil
+pcall(function()
+    for i, fn in ipairs(Controller.beforeTick) do
+        if type(fn) == "function" and debug.info(fn, "s"):find("Hands") then
+            local ok, q = pcall(debug.getupvalue, fn, 1)
+            if ok and type(q) == "table" and q.attacks ~= nil then
+                u116_queue = q
+                handsIndex = i
+                local ok6, af = pcall(debug.getupvalue, fn, 6)
+                if ok6 and type(af) == "function" then
+                    local okT, tq = pcall(debug.getupvalue, af, 1)
+                    if okT and type(tq) == "table" then u224_targets = tq end
+                end
+                break
+            end
+        end
+    end
+end)
+if not u116_queue then return end
+
+-- ── Helpers ────────────────────────────────────────────────────────────
+local function isAlive()
+    local char = LocalPlayer.Character
+    return Controller.state ~= nil and char ~= nil and char:GetAttribute("Alive") == true
+end
+
+local function findHotbar(id)
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it and it.id == id then return i, it end
+    end
+    return nil
+end
+
+-- Returns block coordinates, NOT world/stud coordinates
+local function findPlacementTarget()
+    local eye, state = Controller.eye(), Controller.state
+    if not eye or not state then return nil end
+    local look = Controller.look()
+    
+    -- 1. Where the crosshair is pointing
+    local hit = World.blockRay(eye, look, 4.5, {"Solid"})
+    if hit and hit.normal.Y >= 0.5 then
+        return hit.cell + Vector3.new(0.5, 1.0, 0.5) 
+    end
+    
+    -- 2. Down at the player's feet
+    local origin = state.pos + Vector3.new(0, 0.5, 0)
+    local r = World.blockRay(origin, Vector3.new(0, -1, 0), 5, {"Solid"})
+    if r and r.normal.Y >= 0.5 then
+        return r.cell + Vector3.new(0.5, 1.0, 0.5)
+    end
+    return nil
+end
+
+-- ── Silent Aim (Camera Restore) ────────────────────────────────────────
+local savedYaw, savedPitch = nil, nil
+
+local function aimAtBlockPos(blockPt)
+    local eye = Controller.eye()
+    if not eye or not blockPt then return end
+    local dir = blockPt - eye
+    if dir.Magnitude > 0.1 then
+        local unit = dir.Unit
+        if not savedYaw then
+            savedYaw, savedPitch = Controller.yaw, Controller.pitch
+        end
+        Controller.yaw = math.atan2(-unit.X, -unit.Z)
+        Controller.pitch = math.asin(math.clamp(unit.Y, -0.999, 0.999))
+    end
+end
+
+local function restoreView()
+    if savedYaw ~= nil and savedPitch ~= nil then
+        Controller.yaw = savedYaw
+        Controller.pitch = savedPitch
+        savedYaw, savedPitch = nil, nil
+    end
+end
+
+-- ── State Machine ──────────────────────────────────────────────────────
+local job = nil
+
+local function stepJob()
+    if not job then return end
+    if not isAlive() then job = nil; restoreView(); return end
+    if Controller.tickCount - job.startTick > SETTINGS.MaxJobTicks then
+        job = nil; restoreView(); return
+    end
+
+    local elapsed = Controller.tickCount - job.stepStartTick
+    if job.waitUntilTick and Controller.tickCount < job.waitUntilTick then
+        return
+    end
+
+    -------------------------------------------------- 1. EQUIP RAIL
+    if job.step == "equipRail" then
+        if Hands.inv.selected == job.railSlot then
+            job.step = "useRail"
+            job.stepStartTick = Controller.tickCount
+            job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+            return
+        end
+        if elapsed >= SETTINGS.EquipTimeout then job = nil; return end
+        u116_queue.select  = job.railSlot
+        u116_queue.attacks = 0
+        return
+    end
+
+    -------------------------------------------------- 2. USE RAIL
+    if job.step == "useRail" then
+        if not job.groundWorld then
+            job.groundWorld = findPlacementTarget()
+            if not job.groundWorld then job = nil; return end
+        end
+        aimAtBlockPos(job.groundWorld)
+        u116_queue.attacks = 0
+        if u224_targets then table.clear(u224_targets) end
+        u116_queue.uses = 1
+        job.step = "equipCart"
+        job.stepStartTick = Controller.tickCount
+        job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+        return
+    end
+
+    -------------------------------------------------- 3. EQUIP CART
+    if job.step == "equipCart" then
+        if Hands.inv.selected == job.cartSlot then
+            job.step = "useCart"
+            job.stepStartTick = Controller.tickCount
+            job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+            return
+        end
+        if elapsed >= SETTINGS.EquipTimeout then job = nil; return end
+        u116_queue.select  = job.cartSlot
+        u116_queue.attacks = 0
+        return
+    end
+
+    -------------------------------------------------- 4. USE CART
+    if job.step == "useCart" then
+        aimAtBlockPos(job.groundWorld)
+        u116_queue.attacks = 0
+        if u224_targets then table.clear(u224_targets) end
+        u116_queue.uses = 1
+        job.step = job.useBow and "equipBow" or "equipFlint"
+        job.stepStartTick = Controller.tickCount
+        job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+        return
+    end
+
+    -------------------------------------------------- 5. EQUIP BOW
+    if job.step == "equipBow" then
+        if Hands.inv.selected == job.bowSlot then
+            job.step = "useBow"
+            job.stepStartTick = Controller.tickCount
+            job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+            return
+        end
+        if elapsed >= SETTINGS.EquipTimeout then job = nil; return end
+        u116_queue.select  = job.bowSlot
+        u116_queue.attacks = 0
+        return
+    end
+
+    -------------------------------------------------- 6. USE BOW
+    if job.step == "useBow" then
+        -- Aim at the cart (slightly above the rail block)
+        aimAtBlockPos(job.groundWorld + Vector3.new(0, 0.3, 0))
+        u116_queue.attacks = 0
+        if u224_targets then table.clear(u224_targets) end
+        u116_queue.uses = 1
+        job.step = "holdBow"
+        job.bowStartTick = Controller.tickCount
+        return
+    end
+
+    -------------------------------------------------- 7. HOLD BOW -> RELEASE
+    if job.step == "holdBow" then
+        -- Keep camera locked until release
+        aimAtBlockPos(job.groundWorld + Vector3.new(0, 0.3, 0))
+        
+        if Controller.tickCount - job.bowStartTick >= SETTINGS.BowHoldTicks then
+            if Hands.using then pcall(Hands.stopUsing, false) end
+            job.step = "restore"
+            job.stepStartTick = Controller.tickCount
+            job.waitUntilTick = Controller.tickCount + 1
+        end
+        return
+    end
+
+    -------------------------------------------------- 5b. EQUIP FLINT
+    if job.step == "equipFlint" then
+        if Hands.inv.selected == job.flintSlot then
+            job.step = "useFlint"
+            job.stepStartTick = Controller.tickCount
+            job.waitUntilTick = Controller.tickCount + SETTINGS.StepDelay
+            return
+        end
+        if elapsed >= SETTINGS.EquipTimeout then job = nil; return end
+        u116_queue.select  = job.flintSlot
+        u116_queue.attacks = 0
+        return
+    end
+
+    -------------------------------------------------- 6b. USE FLINT
+    if job.step == "useFlint" then
+        aimAtBlockPos(job.groundWorld)
+        u116_queue.attacks = 0
+        if u224_targets then table.clear(u224_targets) end
+        u116_queue.uses = 1
+        job.step = "restore"
+        job.stepStartTick = Controller.tickCount
+        job.waitUntilTick = Controller.tickCount + 1
+        return
+    end
+
+    -------------------------------------------------- 8. RESTORE SLOT
+    if job.step == "restore" then
+        if Hands.inv.selected ~= job.origSlot then
+            u116_queue.select = job.origSlot
+        end
+        restoreView()
+        job = nil
+        return
+    end
+end
+
+if handsIndex then
+    table.insert(Controller.beforeTick, handsIndex, stepJob)
+else
+    table.insert(Controller.beforeTick, 1, stepJob)
+end
+
+table.insert(Controller.onTick, restoreView)
+
+-- ── GUI ────────────────────────────────────────────────────────────────
+local pg  = LocalPlayer:WaitForChild("PlayerGui")
+local old = pg:FindFirstChild("InstaCartGui")
+if old then old:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "InstaCartGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = pg
+
+local frame = Instance.new("Frame")
+frame.Position = UDim2.new(0, 40, 0, 100)
+frame.Size = UDim2.fromOffset(200, 150)
+frame.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+frame.BackgroundTransparency = 0.15
+frame.BorderSizePixel = 0
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+local stroke = Instance.new("UIStroke", frame)
+stroke.Thickness = 1.4
+stroke.Color = Color3.fromRGB(165, 95, 255)
+stroke.Transparency = 0.2
+
+local title = Instance.new("TextLabel", frame)
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(0, 4)
+title.Size = UDim2.new(1, 0, 0, 20)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextColor3 = Color3.fromRGB(245, 245, 255)
+title.Text = "INSTA CART"
+
+local status = Instance.new("TextLabel", frame)
+status.BackgroundTransparency = 1
+status.Position = UDim2.fromOffset(0, 24)
+status.Size = UDim2.new(1, 0, 0, 14)
+status.Font = Enum.Font.Code
+status.TextSize = 10
+status.TextColor3 = Color3.fromRGB(180, 180, 200)
+status.Text = "Ready (Auto-Aim)"
+
+local btn = Instance.new("TextButton", frame)
+btn.Position = UDim2.fromOffset(10, 46)
+btn.Size = UDim2.new(1, -20, 0, 42)
+btn.BackgroundColor3 = Color3.fromRGB(165, 95, 255)
+btn.BorderSizePixel = 0
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 14
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Text = "DEPLOY"
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+local hint = Instance.new("TextLabel", frame)
+hint.BackgroundTransparency = 1
+hint.Position = UDim2.fromOffset(0, 94)
+hint.Size = UDim2.new(1, 0, 0, 50)
+hint.Font = Enum.Font.Code
+hint.TextSize = 9
+hint.TextColor3 = Color3.fromRGB(140, 140, 160)
+hint.TextWrapped = true
+hint.Text = "0.1s Delays.\nBow auto-aims at the cart.\nDrag title to move."
+
+-- drag
+local dragging, dragStart, startPos
+title.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, input.Position, frame.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                     or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- deploy
+btn.MouseButton1Click:Connect(function()
+    if job then status.Text = "Already running…"; return end
+    if not isAlive() then status.Text = "Fail: not alive"; return end
+
+    local railSlot  = findHotbar("rail")
+    local cartSlot  = findHotbar("tnt_minecart")
+    local bowSlot   = findHotbar("bow")
+    local flintSlot = findHotbar("flint_and_steel")
+
+    if not railSlot then status.Text = "Fail: no rail"; return end
+    if not cartSlot then status.Text = "Fail: no TNT cart"; return end
+
+    local useBow   = bowSlot ~= nil and Hands.hasItem("arrow")
+    local useFlint = flintSlot ~= nil
+    if not useBow and not useFlint then
+        status.Text = "Fail: no bow+arrow or flint"
+        return
+    end
+
+    job = {
+        step          = "equipRail",
+        stepStartTick = Controller.tickCount,
+        startTick     = Controller.tickCount,
+        railSlot      = railSlot,
+        cartSlot      = cartSlot,
+        bowSlot       = bowSlot,
+        flintSlot     = flintSlot,
+        useBow        = useBow,
+        origSlot      = Hands.inv.selected,
+        groundWorld   = nil,
+    }
+    status.Text = "Deploying…"
+end)
+
+RunService.Heartbeat:Connect(function()
+    if job then
+        status.Text = "Step: " .. job.step
+    elseif status.Text:find("^Step") or status.Text == "Deploying…" then
+        status.Text = "Ready"
+    end
+end)
+
