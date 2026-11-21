@@ -1,7 +1,10 @@
 --!nocheck
 -- Spear-Mace Combo — Standalone GUI
 -- Hotkey G to start/stop.
--- Executes Wind Charge -> Spear -> Mace -> Auto-Attack (0.7s Cooldown) Loop.
+-- Executes Wind Charge -> Spear -> Mace -> Auto-Attack loop.
+-- Mace phase:
+--   * While falling: steer toward target, equip mace, and "Attack" when <= 0.6 blocks near.
+--   * While grounded: standard 0.7s auto-attack loop.
 
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
@@ -23,7 +26,7 @@ local Hands           = require(MC_Client.Hands)
 local World           = require(MC_Client.World)
 local Input           = require(MC_Client.Input)
 
-local BLOCK          = Config.BLOCK
+local BLOCK = Config.BLOCK
 
 -------------------------------------------------------------------------------
 -- Unwrap originals
@@ -53,9 +56,7 @@ local u116_queue, u224_targets = nil, nil
 local noteSwapFn = nil
 pcall(function()
     local okNs, ns = pcall(debug.getupvalue, Hands.select, 2)
-    if okNs and type(ns) == "function" then
-        noteSwapFn = ns
-    end
+    if okNs and type(ns) == "function" then noteSwapFn = ns end
     for _, btFn in ipairs(Controller.beforeTick) do
         if type(btFn) == "function" and debug.info(btFn, "s"):find("Hands") then
             local ok1, q = pcall(debug.getupvalue, btFn, 1)
@@ -64,9 +65,7 @@ pcall(function()
                 local ok6, attackFn = pcall(debug.getupvalue, btFn, 6)
                 if ok6 and type(attackFn) == "function" then
                     local okT, tQueue = pcall(debug.getupvalue, attackFn, 1)
-                    if okT and type(tQueue) == "table" then
-                        u224_targets = tQueue
-                    end
+                    if okT and type(tQueue) == "table" then u224_targets = tQueue end
                 end
                 break
             end
@@ -84,15 +83,19 @@ local CFG = {
     SpearWaitTicks   = 5,
     LookDownPitch    = -1.55,
     TargetDummies    = true,
-    
-    -- From provided file
+
     MaceSilentAim    = true,
     AutoShieldBreak  = true,
     SwordIFrameSync  = true,
-    MaceFallSpoof    = false,
-    MaceSpoofHeight  = 12,
-    KillAuraMinCharge= 0.90,
-    MaceAutoReturnSword = true,
+
+    -- Fall behavior
+    MaceFallAttackRange = 0.6,    -- BLOCKS (multiplied by BLOCK) - fire window
+    MaceFollowTarget    = true,   -- steer toward target while falling
+    MaceFollowDeadzone  = 0.35,   -- stop pressing keys when this close (blocks)
+    MaceGroundedInterval = 14,    -- ticks between grounded auto-attacks (~0.7s)
+    
+    -- Swing cooldowns
+    FallSwingCooldown   = 5,      -- ticks between swings while falling
 }
 
 local State = {
@@ -106,6 +109,8 @@ local State = {
     LastResult    = "",
     JumpReleaseTick = nil,
     LastAttackTick  = 0,
+    Falling       = false,
+    FallDist      = 0,
 }
 
 local enemyHurtTicks = {}
@@ -118,13 +123,8 @@ local pendingRestoreSlot = nil
 local pendingRestoreTick = 0
 local lmbClicks = {}
 
-local function recordLMB()
-    table.insert(lmbClicks, os.clock())
-end
-
-local function log(msg)
-    print("[SpearMace] " .. msg)
-end
+local function recordLMB() table.insert(lmbClicks, os.clock()) end
+local function log(msg) print("[SpearMace] " .. msg) end
 
 pcall(function()
     Net.on("hurt", function(a1)
@@ -136,7 +136,7 @@ pcall(function()
 end)
 
 -------------------------------------------------------------------------------
--- Helpers (Extracted from message (3).txt)
+-- Helpers
 -------------------------------------------------------------------------------
 local function isAlive()
     if Workspace:GetAttribute("JugHold") == true then return false end
@@ -209,13 +209,6 @@ local function getBestSwordSlot()
     end))
 end
 
-local function getBestAxeSlot()
-    return (findHotbarSlot(function(it)
-        local def = Items.def(it)
-        return def and def.disablesShield == true
-    end))
-end
-
 local function getTargetHurtRemaining(target)
     if not target or not target.model then return 0 end
     local eid = target.model:GetAttribute("EntityId")
@@ -233,18 +226,6 @@ local function getEffectiveAttackStrength()
         end
     end
     return Hands.strength(0)
-end
-
-local function isTargetShieldingFrom(eyePos, target)
-    local model = target.model
-    if model and model:GetAttribute("Using") == "shield" and model.PrimaryPart then
-        local toAttacker = eyePos * BLOCK - model.PrimaryPart.Position
-        local look = model.PrimaryPart.CFrame.LookVector
-        if Vector3.new(toAttacker.X, 0, toAttacker.Z):Dot(Vector3.new(look.X, 0, look.Z)) > 0 then
-            return true
-        end
-    end
-    return false
 end
 
 local function getBestAimPointAndAngles(eyePos, target)
@@ -275,13 +256,12 @@ local function getClosestTarget(maxReach, fovDeg)
     local myLook  = Controller.look()
     local cosHalf = math.cos(math.rad((fovDeg or 360) * 0.5))
     local best, bestDist = nil, maxReach
-    
+
     for _, t in ipairs(World.targets()) do
         local isDummy = (World.folder and World.folder.Dummies and t.model.Parent == World.folder.Dummies)
         if not CFG.TargetDummies and isDummy then
             continue
         end
-        
         local aimDir = getBestAimPointAndAngles(eye, t)
         if (fovDeg or 360) >= 359 or myLook:Dot(aimDir) >= cosHalf then
             local hitDist = origRayBox(eye, aimDir, t.feet, t.height, 0, t.width)
@@ -314,82 +294,170 @@ local function restoreCamera()
     end
 end
 
+-------------------------------------------------------------------------------
+-- Fall helpers: steering + distance-to-hitbox
+-------------------------------------------------------------------------------
+local function setMoveVirtuals(forward, back, left, right)
+    pcall(Input.setVirtual, "forward", forward)
+    pcall(Input.setVirtual, "back",    back)
+    pcall(Input.setVirtual, "left",    left)
+    pcall(Input.setVirtual, "right",   right)
+
+    local char = LocalPlayer.Character
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if not (forward or back or left or right) then
+        hum:Move(Vector3.zero)
+        return
+    end
+    local look = Controller.look()
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 1e-3 then return end
+    flat = flat.Unit
+    local rightV = Vector3.new(-flat.Z, 0, flat.X)
+    local dir = Vector3.zero
+    if forward then dir = dir + flat  end
+    if back    then dir = dir - flat  end
+    if right   then dir = dir + rightV end
+    if left    then dir = dir - rightV end
+    if dir.Magnitude > 1e-3 then
+        hum:Move(dir.Unit)
+    else
+        hum:Move(Vector3.zero)
+    end
+end
+
+local function releaseAllMoveInputs()
+    setMoveVirtuals(false, false, false, false)
+end
+
+local function followTargetHorizontally(target)
+    if not target or not target.feet then
+        releaseAllMoveInputs()
+        return
+    end
+    local char = LocalPlayer.Character
+    local hrp  = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
+    if not hrp then releaseAllMoveInputs() return end
+
+    local myPos = hrp.Position
+    local tPos  = target.feet
+    local delta = Vector3.new(tPos.X - myPos.X, 0, tPos.Z - myPos.Z)
+    local deadzone = CFG.MaceFollowDeadzone * BLOCK
+    if delta.Magnitude < deadzone then
+        releaseAllMoveInputs()
+        return
+    end
+
+    local look = Controller.look()
+    local flat = Vector3.new(look.X, 0, look.Z)
+    if flat.Magnitude < 1e-3 then releaseAllMoveInputs() return end
+    flat = flat.Unit
+    local rightV = Vector3.new(-flat.Z, 0, flat.X)
+
+    local fDot = delta:Dot(flat)
+    local rDot = delta:Dot(rightV)
+
+    setMoveVirtuals(fDot > 0.05, fDot < -0.05, rDot < -0.05, rDot > 0.05)
+end
+
+-- AABB-clamped distance from the player's HRP to the target's hitbox surface (studs)
+local function closestDistToTarget(target)
+    local char = LocalPlayer.Character
+    local hrp  = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
+    if not hrp or not target or not target.feet then return math.huge end
+
+    local width  = target.width  or Config.WIDTH
+    local height = target.height or Config.HEIGHT
+    local halfW  = width * 0.5
+    local feet   = target.feet
+
+    local cx = math.clamp(hrp.Position.X, feet.X - halfW, feet.X + halfW)
+    local cy = math.clamp(hrp.Position.Y, feet.Y,           feet.Y + height)
+    local cz = math.clamp(hrp.Position.Z, feet.Z - halfW, feet.Z + halfW)
+    return (hrp.Position - Vector3.new(cx, cy, cz)).Magnitude
+end
+
+local function isCharacterFalling(state)
+    if state then
+        if state.gliding then return false end
+        if state.onGround == false then return true end
+    end
+    local char = LocalPlayer.Character
+    local hrp  = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
+    if hrp then
+        local vel = hrp.AssemblyLinearVelocity or hrp.Velocity
+        if vel and vel.Y < -2 then return true end
+    end
+    return false
+end
+
+-------------------------------------------------------------------------------
+-- stopCombo
+-------------------------------------------------------------------------------
 local function stopCombo(msg)
+    releaseAllMoveInputs()
     restoreCamera()
     State.Active      = false
     State.Stage       = "idle"
     State.StageTick   = 0
     State.Target      = nil
     State.TargetName  = ""
-    if msg then 
-        State.LastResult = msg 
+    State.Falling     = false
+    State.FallDist    = 0
+    if msg then
+        State.LastResult = msg
         log("Stopped: " .. msg)
     end
     if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
 end
 
--- Exact native attack logic from the file
+-------------------------------------------------------------------------------
+-- Native attack (Standard swing, acts exactly like clicking the Attack button)
+-------------------------------------------------------------------------------
 local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
     local state = Controller.state
     local eye = Controller.eye()
     if not state or not eye or not target or not u116_queue then return false end
     if not forceMaceSmash and Hands.using and Hands.using.kind == "eat" then return false end
-    
+
     if forceMaceSmash then
         if Controller.tickCount - lastMaceSmashTick < 6 then return false end
     else
         if Controller.tickCount - lastAutoAttackTick < 3 then return false end
     end
-    
+
     local aimLook, aimYaw, aimPitch = Controller.look(), Controller.yaw, Controller.pitch
-    if not noSilentRotate and (CFG.MaceSilentAim) then
+    if not noSilentRotate and CFG.MaceSilentAim then
         aimLook, aimYaw, aimPitch = getBestAimPointAndAngles(eye, target)
     end
-    
-    local shielded = isTargetShieldingFrom(eye, target)
-    if not forceMaceSmash and not shielded and CFG.SwordIFrameSync then
-        if getTargetHurtRemaining(target) > 0 then return false end
-    end
-    
+
     local origSlot = Hands.inv.selected
     local chosenSlot = origSlot
-    local origHeld = Hands.held()
-    local origDef = origHeld and Items.def(origHeld)
-    local usedBreachSwap = false
-    
-    if shielded and CFG.AutoShieldBreak then
-        local axeSlot = getBestAxeSlot()
-        if axeSlot then chosenSlot = axeSlot end
-    elseif forceMaceSmash then
-        local effFall = CFG.MaceFallSpoof and math.max(state.fallDistance, CFG.MaceSpoofHeight) or state.fallDistance
-        local maceSlot = getBestMaceSlot(effFall)
+
+    if forceMaceSmash then
+        local maceSlot = getBestMaceSlot(state.fallDistance or 0)
         if maceSlot then chosenSlot = maceSlot end
     end
-    
+
     if Hands.using and Hands.using.kind == "shield" then
         pcall(Hands.stopUsing, false)
     end
-    
+
     if not forceMaceSmash then
         local effCharge = getEffectiveAttackStrength()
         if effCharge < (tonumber(CFG.KillAuraMinCharge) or 0.90) then return false end
     end
-    
+
     if chosenSlot ~= origSlot then
         u116_queue.select = chosenSlot
-        if usedBreachSwap then
-            pendingRestoreSlot = origSlot
-            pendingRestoreTick = Controller.tickCount + 1
-        elseif forceMaceSmash and CFG.MaceAutoReturnSword then
-            pendingRestoreSlot = getBestSwordSlot() or origSlot
-            pendingRestoreTick = Controller.tickCount + 1
-        elseif shielded and CFG.AutoShieldBreak then
+        if forceMaceSmash then
             pendingRestoreSlot = getBestSwordSlot() or origSlot
             pendingRestoreTick = Controller.tickCount + 1
         end
     end
-    
-    if not noSilentRotate and (CFG.MaceSilentAim) then
+
+    if not noSilentRotate and CFG.MaceSilentAim then
         if savedYaw == nil then
             savedYaw = Controller.yaw
             savedPitch = Controller.pitch
@@ -397,7 +465,49 @@ local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
         Controller.yaw = aimYaw
         Controller.pitch = aimPitch
     end
-    
+
+    u116_queue.attacks = 1
+    if u224_targets then
+        table.clear(u224_targets)
+        table.insert(u224_targets, { look = Controller.look(), target = target })
+    end
+
+    recordLMB()
+    lastSwordTarget = target
+    lastSwordTargetAt = os.clock()
+    lastAutoAttackTick = Controller.tickCount
+    if forceMaceSmash then lastMaceSmashTick = Controller.tickCount end
+    return true
+end
+
+-- Simulates a physical click on the mobile "Attack" button / Left Click on PC
+local function queueAttackButton(target)
+    local state = Controller.state
+    local eye = Controller.eye()
+    if not state or not eye or not target or not u116_queue then return false end
+    if Controller.tickCount - State.LastAttackTick < CFG.FallSwingCooldown then return false end
+
+    -- 1. Equip Mace
+    local origSlot = Hands.inv.selected
+    local maceSlot = getBestMaceSlot(state.fallDistance or 0)
+    if maceSlot and origSlot ~= maceSlot then
+        u116_queue.select = maceSlot
+    end
+
+    if Hands.using and Hands.using.kind == "shield" then
+        pcall(Hands.stopUsing, false)
+    end
+
+    -- 2. Aim at target
+    local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, target)
+    if savedYaw == nil then
+        savedYaw = Controller.yaw
+        savedPitch = Controller.pitch
+    end
+    Controller.yaw = aimYaw
+    Controller.pitch = aimPitch
+
+    -- 3. Simulate clicking the attack button (Sets attack input to 1)
     u116_queue.attacks = 1
     if u224_targets then
         table.clear(u224_targets)
@@ -405,10 +515,7 @@ local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
     end
     
     recordLMB()
-    lastSwordTarget = target
-    lastSwordTargetAt = os.clock()
-    lastAutoAttackTick = Controller.tickCount
-    if forceMaceSmash then lastMaceSmashTick = Controller.tickCount end
+    State.LastAttackTick = Controller.tickCount
     return true
 end
 
@@ -457,12 +564,12 @@ local function onPreTick(state)
             if tick > 60 then stopCombo("WC cooldown timeout") end
             return
         end
-        
+
         if state.onGround then
             pcall(Input.setVirtual, "jump", true)
             State.JumpReleaseTick = Controller.tickCount + 1
         end
-        
+
         u116_queue.select  = wcSlot
         Controller.pitch   = CFG.LookDownPitch
         u116_queue.attacks = 0
@@ -487,26 +594,26 @@ local function onPreTick(state)
         end
         local live = findLiveTarget(State.Target.model)
         if live then State.Target = live end
-        
+
         local spearSlot = getAnySpearSlot()
         if not spearSlot then stopCombo("No spear") return end
-        
+
         if getEffectiveAttackStrength() < 1 then
             if tick > 60 then stopCombo("Spear cooldown timeout") end
             return
         end
-        
+
         if Hands.using and Hands.using.kind == "shield" then
             pcall(Hands.stopUsing, false)
         end
-        
+
         local eye = Controller.eye()
         if eye then
             local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
             Controller.yaw = aimYaw
             Controller.pitch = aimPitch
         end
-        
+
         u116_queue.select  = spearSlot
         u116_queue.attacks = 1
         if u224_targets then
@@ -534,33 +641,61 @@ local function onPreTick(state)
 
     elseif State.Stage == "mace_equip" then
         local maceSlot = getBestMaceSlot(state.fallDistance or 0)
-        if not maceSlot then stopCombo("No mace") return end
+        if not maceSlot then
+            releaseAllMoveInputs()
+            stopCombo("No mace")
+            return
+        end
         u116_queue.select    = maceSlot
         State.Stage          = "mace_attack"
         State.StageTick      = 0
         State.LastAttackTick = 0
-        log("Equipped mace, starting auto-attack loop")
+        log("Equipped mace")
 
     elseif State.Stage == "mace_attack" then
         if not State.Target or not isTargetAlive(State.Target) then
-            stopCombo("Target died") return
+            releaseAllMoveInputs()
+            stopCombo("Target died")
+            return
         end
         local live = findLiveTarget(State.Target.model)
         if live then State.Target = live end
-        
-        -- Lock camera
+
+        -- Keep camera locked on target
         local eye = Controller.eye()
         if eye then
             local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
-            Controller.yaw = aimYaw
+            Controller.yaw   = aimYaw
             Controller.pitch = aimPitch
         end
-        
-        -- Auto-attack exactly every 0.7 seconds (approx 14 ticks)
-        if Controller.tickCount - State.LastAttackTick >= 14 then
-            if queueNativeAttack(State.Target, true, false) then
-                State.LastAttackTick = Controller.tickCount
-                log("Mace auto-attack fired")
+
+        local falling = isCharacterFalling(state)
+        State.Falling  = falling
+        State.FallDist = closestDistToTarget(State.Target)
+
+        local fireRange = CFG.MaceFallAttackRange * BLOCK   -- blocks → studs
+        local inRange   = State.FallDist <= fireRange
+
+        if falling then
+            -- 1) Follow target while in the air
+            if CFG.MaceFollowTarget then
+                followTargetHorizontally(State.Target)
+            end
+
+            -- 2) Just press the Attack button when in range
+            if inRange then
+                if queueAttackButton(State.Target) then
+                    log(string.format("Clicked Attack (Mobile/PC) | dist=%.2f", State.FallDist))
+                end
+            end
+        else
+            -- Landed — release movement keys, back to standard 0.7s auto-attack loop
+            releaseAllMoveInputs()
+            if Controller.tickCount - State.LastAttackTick >= CFG.MaceGroundedInterval then
+                if queueNativeAttack(State.Target, true, false) then
+                    State.LastAttackTick = Controller.tickCount
+                    log("Grounded mace auto-attack fired")
+                end
             end
         end
     end
@@ -599,19 +734,18 @@ table.insert(Controller.beforeTick, 1, onPreTick)
 table.insert(Controller.onTick, onPostTick)
 
 -------------------------------------------------------------------------------
--- Action / Start function
+-- Start / stop
 -------------------------------------------------------------------------------
 local function startCombo()
-    if State.Active then 
+    if State.Active then
         stopCombo("Cancelled")
-        return 
+        return
     end
-    
     if not u116_queue then State.LastResult = "Queue not found" return end
     if not findWindChargeSlot() then State.LastResult = "No wind charge in hotbar" return end
     if not getAnySpearSlot() then State.LastResult = "No spear in hotbar" return end
     if not getBestMaceSlot(0) then State.LastResult = "No mace in hotbar" return end
-    
+
     State.Active        = true
     State.Stage         = "idle"
     State.StageTick     = 0
@@ -660,7 +794,6 @@ Main.BorderSizePixel  = 0
 Main.Active           = true
 Main.Parent           = ScreenGui
 Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 8)
-
 local Stroke = Instance.new("UIStroke", Main)
 Stroke.Color     = Accent
 Stroke.Thickness = 1.2
@@ -889,7 +1022,11 @@ function GUI.UpdateStatus()
         elseif stage == "mace_equip" then
             StageLbl.Text = "Mace Equipped"
         elseif stage == "mace_attack" then
-            StageLbl.Text = "Auto Attack (0.7s)"
+            if State.Falling then
+                StageLbl.Text = string.format("Falling → Mace (%.2f)", State.FallDist)
+            else
+                StageLbl.Text = "Auto Attack (0.7s)"
+            end
         end
     end
 
