@@ -1,7 +1,7 @@
 --!nocheck
 -- Spear-Mace Combo — Standalone GUI
 -- Hotkey G to start/stop.
--- Loop: Wind Charge -> Spear -> Mace (proximity smash 0.6m when falling, 1.0s timer fallback)
+-- Executes Wind Charge -> Spear -> Mace -> Auto-Attack (0.7s Cooldown) Loop.
 
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
@@ -81,49 +81,38 @@ local CFG = {
     Range            = 24,
     ActivateKey      = Enum.KeyCode.G,
     WcWaitTicks      = 5,
-    SpearWaitTicks   = 12,   -- was 5; bumped so mace isn't eaten by spear i-frames
+    SpearWaitTicks   = 5,
     LookDownPitch    = -1.55,
     TargetDummies    = true,
-
-    -- Auto-attack interval (fallback when proximity is never reached)
-    AttackInterval   = 20,   -- 1.0 second @ 20 TPS
-
-    -- Proximity mace smash (fires while falling when close to target)
-    MaceSmashProximityEnabled = true,
-    MaceSmashProximity        = 0.6,   -- 3D distance (blocks) player-feet -> target-feet
-    MaceTimerFallback         = true,  -- also fire on the 1.0s timer as a safety net
-
-    -- From the full client config
-    MaceSilentAim       = true,
-    Mace1TickSwap       = true,  -- FIX: was nil in the standalone → attacks were skipped on swap ticks
-    MaceDualSmart       = true,
-    MaceFallSpoof       = true,  -- FIX: was false → smash failed when already landed
-    MaceSpoofHeight     = 12,
-    AutoShieldBreak     = true,
-    SwordIFrameSync     = true,
-    KillAuraMinCharge   = 0.90,
+    
+    -- From provided file
+    MaceSilentAim    = true,
+    AutoShieldBreak  = true,
+    SwordIFrameSync  = true,
+    MaceFallSpoof    = false,
+    MaceSpoofHeight  = 12,
+    KillAuraMinCharge= 0.90,
     MaceAutoReturnSword = true,
 }
 
 local State = {
-    Active          = false,
-    Stage           = "idle",
-    StageTick       = 0,
-    Target          = nil,
-    TargetName      = "",
-    SavedYaw        = nil,
-    SavedPitch      = nil,
-    LastResult      = "",
+    Active        = false,
+    Stage         = "idle",
+    StageTick     = 0,
+    Target        = nil,
+    TargetName    = "",
+    SavedYaw      = nil,
+    SavedPitch    = nil,
+    LastResult    = "",
     JumpReleaseTick = nil,
     LastAttackTick  = 0,
-    LastDist        = math.huge,
 }
 
-local enemyHurtTicks     = {}
-local lastSwordTarget    = nil
-local lastSwordTargetAt  = 0
+local enemyHurtTicks = {}
+local lastSwordTarget = nil
+local lastSwordTargetAt = 0
 local lastAutoAttackTick = 0
-local lastMaceSmashTick  = 0
+local lastMaceSmashTick = 0
 local savedYaw, savedPitch = nil, nil
 local pendingRestoreSlot = nil
 local pendingRestoreTick = 0
@@ -147,7 +136,7 @@ pcall(function()
 end)
 
 -------------------------------------------------------------------------------
--- Helpers
+-- Helpers (Extracted from message (3).txt)
 -------------------------------------------------------------------------------
 local function isAlive()
     if Workspace:GetAttribute("JugHold") == true then return false end
@@ -208,10 +197,8 @@ local function getBestMaceSlot(fallDist)
             end
         end
     end
-    if CFG.MaceDualSmart then
-        if fallDist > 5.5 and densitySlot then return densitySlot end
-        if breachSlot and fallDist <= 5.5 then return breachSlot end
-    end
+    if fallDist > 5.5 and densitySlot then return densitySlot end
+    if breachSlot and fallDist <= 5.5 then return breachSlot end
     return densitySlot or breachSlot or anyMaceSlot
 end
 
@@ -288,13 +275,13 @@ local function getClosestTarget(maxReach, fovDeg)
     local myLook  = Controller.look()
     local cosHalf = math.cos(math.rad((fovDeg or 360) * 0.5))
     local best, bestDist = nil, maxReach
-
+    
     for _, t in ipairs(World.targets()) do
         local isDummy = (World.folder and World.folder.Dummies and t.model.Parent == World.folder.Dummies)
         if not CFG.TargetDummies and isDummy then
             continue
         end
-
+        
         local aimDir = getBestAimPointAndAngles(eye, t)
         if (fovDeg or 360) >= 359 or myLook:Dot(aimDir) >= cosHalf then
             local hitDist = origRayBox(eye, aimDir, t.feet, t.height, 0, t.width)
@@ -334,45 +321,42 @@ local function stopCombo(msg)
     State.StageTick   = 0
     State.Target      = nil
     State.TargetName  = ""
-    State.LastDist    = math.huge
-    if msg then
-        State.LastResult = msg
+    if msg then 
+        State.LastResult = msg 
         log("Stopped: " .. msg)
     end
     if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
 end
 
--------------------------------------------------------------------------------
--- Native attack queue
--------------------------------------------------------------------------------
+-- Exact native attack logic from the file
 local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
     local state = Controller.state
     local eye = Controller.eye()
     if not state or not eye or not target or not u116_queue then return false end
     if not forceMaceSmash and Hands.using and Hands.using.kind == "eat" then return false end
-
+    
     if forceMaceSmash then
         if Controller.tickCount - lastMaceSmashTick < 6 then return false end
     else
         if Controller.tickCount - lastAutoAttackTick < 3 then return false end
     end
-
+    
     local aimLook, aimYaw, aimPitch = Controller.look(), Controller.yaw, Controller.pitch
     if not noSilentRotate and (CFG.MaceSilentAim) then
         aimLook, aimYaw, aimPitch = getBestAimPointAndAngles(eye, target)
     end
-
+    
     local shielded = isTargetShieldingFrom(eye, target)
     if not forceMaceSmash and not shielded and CFG.SwordIFrameSync then
         if getTargetHurtRemaining(target) > 0 then return false end
     end
-
+    
     local origSlot = Hands.inv.selected
     local chosenSlot = origSlot
     local origHeld = Hands.held()
     local origDef = origHeld and Items.def(origHeld)
     local usedBreachSwap = false
-
+    
     if shielded and CFG.AutoShieldBreak then
         local axeSlot = getBestAxeSlot()
         if axeSlot then chosenSlot = axeSlot end
@@ -381,16 +365,16 @@ local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
         local maceSlot = getBestMaceSlot(effFall)
         if maceSlot then chosenSlot = maceSlot end
     end
-
+    
     if Hands.using and Hands.using.kind == "shield" then
         pcall(Hands.stopUsing, false)
     end
-
+    
     if not forceMaceSmash then
         local effCharge = getEffectiveAttackStrength()
         if effCharge < (tonumber(CFG.KillAuraMinCharge) or 0.90) then return false end
     end
-
+    
     if chosenSlot ~= origSlot then
         u116_queue.select = chosenSlot
         if usedBreachSwap then
@@ -403,19 +387,8 @@ local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
             pendingRestoreSlot = getBestSwordSlot() or origSlot
             pendingRestoreTick = Controller.tickCount + 1
         end
-        -- Only skip the attack tick when 1-tick-swap is explicitly disabled
-        if forceMaceSmash and not CFG.Mace1TickSwap then
-            return true
-        end
     end
-
-    -- Apply fall spoof unconditionally for mace smash
-    if forceMaceSmash and CFG.MaceFallSpoof then
-        state.fallDistance = math.max(state.fallDistance, CFG.MaceSpoofHeight)
-        state.onGround = false
-        state.gliding = false
-    end
-
+    
     if not noSilentRotate and (CFG.MaceSilentAim) then
         if savedYaw == nil then
             savedYaw = Controller.yaw
@@ -424,13 +397,13 @@ local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
         Controller.yaw = aimYaw
         Controller.pitch = aimPitch
     end
-
+    
     u116_queue.attacks = 1
     if u224_targets then
         table.clear(u224_targets)
         table.insert(u224_targets, { look = Controller.look(), target = target })
     end
-
+    
     recordLMB()
     lastSwordTarget = target
     lastSwordTargetAt = os.clock()
@@ -484,12 +457,12 @@ local function onPreTick(state)
             if tick > 60 then stopCombo("WC cooldown timeout") end
             return
         end
-
+        
         if state.onGround then
             pcall(Input.setVirtual, "jump", true)
             State.JumpReleaseTick = Controller.tickCount + 1
         end
-
+        
         u116_queue.select  = wcSlot
         Controller.pitch   = CFG.LookDownPitch
         u116_queue.attacks = 0
@@ -514,26 +487,26 @@ local function onPreTick(state)
         end
         local live = findLiveTarget(State.Target.model)
         if live then State.Target = live end
-
+        
         local spearSlot = getAnySpearSlot()
         if not spearSlot then stopCombo("No spear") return end
-
+        
         if getEffectiveAttackStrength() < 1 then
             if tick > 60 then stopCombo("Spear cooldown timeout") end
             return
         end
-
+        
         if Hands.using and Hands.using.kind == "shield" then
             pcall(Hands.stopUsing, false)
         end
-
+        
         local eye = Controller.eye()
         if eye then
             local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
             Controller.yaw = aimYaw
             Controller.pitch = aimPitch
         end
-
+        
         u116_queue.select  = spearSlot
         u116_queue.attacks = 1
         if u224_targets then
@@ -574,7 +547,7 @@ local function onPreTick(state)
         end
         local live = findLiveTarget(State.Target.model)
         if live then State.Target = live end
-
+        
         -- Lock camera
         local eye = Controller.eye()
         if eye then
@@ -582,9 +555,9 @@ local function onPreTick(state)
             Controller.yaw = aimYaw
             Controller.pitch = aimPitch
         end
-
-        -- Auto-attack exactly every 1.0 seconds (20 ticks @ 20 TPS)
-        if Controller.tickCount - State.LastAttackTick >= (CFG.AttackInterval or 20) then
+        
+        -- Auto-attack exactly every 0.7 seconds (approx 14 ticks)
+        if Controller.tickCount - State.LastAttackTick >= 14 then
             if queueNativeAttack(State.Target, true, false) then
                 State.LastAttackTick = Controller.tickCount
                 log("Mace auto-attack fired")
@@ -629,16 +602,16 @@ table.insert(Controller.onTick, onPostTick)
 -- Action / Start function
 -------------------------------------------------------------------------------
 local function startCombo()
-    if State.Active then
+    if State.Active then 
         stopCombo("Cancelled")
-        return
+        return 
     end
-
+    
     if not u116_queue then State.LastResult = "Queue not found" return end
     if not findWindChargeSlot() then State.LastResult = "No wind charge in hotbar" return end
     if not getAnySpearSlot() then State.LastResult = "No spear in hotbar" return end
     if not getBestMaceSlot(0) then State.LastResult = "No mace in hotbar" return end
-
+    
     State.Active        = true
     State.Stage         = "idle"
     State.StageTick     = 0
@@ -916,7 +889,7 @@ function GUI.UpdateStatus()
         elseif stage == "mace_equip" then
             StageLbl.Text = "Mace Equipped"
         elseif stage == "mace_attack" then
-            StageLbl.Text = "Auto Attack (1.0s)"
+            StageLbl.Text = "Auto Attack (0.7s)"
         end
     end
 
