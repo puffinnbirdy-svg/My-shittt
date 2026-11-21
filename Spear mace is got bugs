@@ -1,0 +1,959 @@
+--!nocheck
+-- Spear-Mace Combo — Standalone GUI
+-- Hotkey G to start/stop.
+-- Loop: Wind Charge -> Spear -> Mace (proximity smash 0.6m when falling, 1.0s timer fallback)
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local LocalPlayer   = Players.LocalPlayer
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local MC_Client     = PlayerScripts:WaitForChild("MC")
+local MC_Shared     = ReplicatedStorage:WaitForChild("MC")
+
+local Config          = require(MC_Shared.Config)
+local Items           = require(MC_Shared.Items)
+local Combat          = require(MC_Shared.Combat)
+local Net             = require(MC_Client.Net)
+local Controller      = require(MC_Client.Controller)
+local Hands           = require(MC_Client.Hands)
+local World           = require(MC_Client.World)
+local Input           = require(MC_Client.Input)
+
+local BLOCK          = Config.BLOCK
+
+-------------------------------------------------------------------------------
+-- Unwrap originals
+-------------------------------------------------------------------------------
+local origRayBox = World.rayBox
+pcall(function()
+    for _ = 1, 5 do
+        if debug.info(World.rayBox, "s") == "" then
+            for i = 1, 5 do
+                local ok, upv = pcall(debug.getupvalue, World.rayBox, i)
+                if ok and type(upv) == "function" then
+                    World.rayBox = upv
+                    break
+                end
+            end
+        else
+            break
+        end
+    end
+end)
+origRayBox = World.rayBox
+
+-------------------------------------------------------------------------------
+-- Queue extraction
+-------------------------------------------------------------------------------
+local u116_queue, u224_targets = nil, nil
+local noteSwapFn = nil
+pcall(function()
+    local okNs, ns = pcall(debug.getupvalue, Hands.select, 2)
+    if okNs and type(ns) == "function" then
+        noteSwapFn = ns
+    end
+    for _, btFn in ipairs(Controller.beforeTick) do
+        if type(btFn) == "function" and debug.info(btFn, "s"):find("Hands") then
+            local ok1, q = pcall(debug.getupvalue, btFn, 1)
+            if ok1 and type(q) == "table" and q.attacks ~= nil then
+                u116_queue = q
+                local ok6, attackFn = pcall(debug.getupvalue, btFn, 6)
+                if ok6 and type(attackFn) == "function" then
+                    local okT, tQueue = pcall(debug.getupvalue, attackFn, 1)
+                    if okT and type(tQueue) == "table" then
+                        u224_targets = tQueue
+                    end
+                end
+                break
+            end
+        end
+    end
+end)
+
+-------------------------------------------------------------------------------
+-- Config & State Setup
+-------------------------------------------------------------------------------
+local CFG = {
+    Range            = 24,
+    ActivateKey      = Enum.KeyCode.G,
+    WcWaitTicks      = 5,
+    SpearWaitTicks   = 12,   -- was 5; bumped so mace isn't eaten by spear i-frames
+    LookDownPitch    = -1.55,
+    TargetDummies    = true,
+
+    -- Auto-attack interval (fallback when proximity is never reached)
+    AttackInterval   = 20,   -- 1.0 second @ 20 TPS
+
+    -- Proximity mace smash (fires while falling when close to target)
+    MaceSmashProximityEnabled = true,
+    MaceSmashProximity        = 0.6,   -- 3D distance (blocks) player-feet -> target-feet
+    MaceTimerFallback         = true,  -- also fire on the 1.0s timer as a safety net
+
+    -- From the full client config
+    MaceSilentAim       = true,
+    Mace1TickSwap       = true,  -- FIX: was nil in the standalone → attacks were skipped on swap ticks
+    MaceDualSmart       = true,
+    MaceFallSpoof       = true,  -- FIX: was false → smash failed when already landed
+    MaceSpoofHeight     = 12,
+    AutoShieldBreak     = true,
+    SwordIFrameSync     = true,
+    KillAuraMinCharge   = 0.90,
+    MaceAutoReturnSword = true,
+}
+
+local State = {
+    Active          = false,
+    Stage           = "idle",
+    StageTick       = 0,
+    Target          = nil,
+    TargetName      = "",
+    SavedYaw        = nil,
+    SavedPitch      = nil,
+    LastResult      = "",
+    JumpReleaseTick = nil,
+    LastAttackTick  = 0,
+    LastDist        = math.huge,
+}
+
+local enemyHurtTicks     = {}
+local lastSwordTarget    = nil
+local lastSwordTargetAt  = 0
+local lastAutoAttackTick = 0
+local lastMaceSmashTick  = 0
+local savedYaw, savedPitch = nil, nil
+local pendingRestoreSlot = nil
+local pendingRestoreTick = 0
+local lmbClicks = {}
+
+local function recordLMB()
+    table.insert(lmbClicks, os.clock())
+end
+
+local function log(msg)
+    print("[SpearMace] " .. msg)
+end
+
+pcall(function()
+    Net.on("hurt", function(a1)
+        if type(a1) ~= "table" then return end
+        if a1.id ~= nil and a1.fresh then
+            enemyHurtTicks[a1.id] = (Controller.tickCount or 0) + 10
+        end
+    end)
+end)
+
+-------------------------------------------------------------------------------
+-- Helpers
+-------------------------------------------------------------------------------
+local function isAlive()
+    if Workspace:GetAttribute("JugHold") == true then return false end
+    local char = LocalPlayer.Character
+    return Controller.state ~= nil and char ~= nil and char:GetAttribute("Alive") == true
+end
+
+local function isTargetAlive(target)
+    if not target or not target.model then return false end
+    if not target.model.Parent then return false end
+    local alive = target.model:GetAttribute("Alive")
+    if alive == false then return false end
+    local hp = target.model:GetAttribute("Health")
+    if type(hp) == "number" and hp <= 0 then return false end
+    return true
+end
+
+local function findLiveTarget(model)
+    if not model or not model.Parent then return nil end
+    for _, t in ipairs(World.targets()) do
+        if t.model == model then return t end
+    end
+    return nil
+end
+
+local function findHotbarSlot(pred)
+    for i = 1, 9 do
+        local it = Hands.inv.hotbar[i]
+        if it and pred(it) then return i, it end
+    end
+    return nil, nil
+end
+
+local function findWindChargeSlot()
+    return findHotbarSlot(function(it) return it.id == "wind_charge" end)
+end
+
+local function getAnySpearSlot()
+    return findHotbarSlot(function(it)
+        local def = Items.def(it)
+        return def and def.kind == "spear"
+    end)
+end
+
+local function getBestMaceSlot(fallDist)
+    local densitySlot, breachSlot, anyMaceSlot = nil, nil, nil
+    for i = 1, 9 do
+        local item = Hands.inv.hotbar[i]
+        if item and item.id == "mace" then
+            anyMaceSlot = anyMaceSlot or i
+            if item.ench then
+                if (item.ench.density or 0) > 0 or (item.ench.wind_burst or 0) > 0 then
+                    densitySlot = densitySlot or i
+                end
+                if (item.ench.breach or 0) > 0 then
+                    breachSlot = breachSlot or i
+                end
+            end
+        end
+    end
+    if CFG.MaceDualSmart then
+        if fallDist > 5.5 and densitySlot then return densitySlot end
+        if breachSlot and fallDist <= 5.5 then return breachSlot end
+    end
+    return densitySlot or breachSlot or anyMaceSlot
+end
+
+local function getBestSwordSlot()
+    return (findHotbarSlot(function(it)
+        local def = Items.def(it)
+        return def and def.kind == "sword"
+    end))
+end
+
+local function getBestAxeSlot()
+    return (findHotbarSlot(function(it)
+        local def = Items.def(it)
+        return def and def.disablesShield == true
+    end))
+end
+
+local function getTargetHurtRemaining(target)
+    if not target or not target.model then return 0 end
+    local eid = target.model:GetAttribute("EntityId")
+    if eid == nil then return 0 end
+    return (enemyHurtTicks[eid] or 0) - Controller.tickCount
+end
+
+local function getEffectiveAttackStrength()
+    if noteSwapFn then
+        local ok1, u95 = pcall(debug.getupvalue, noteSwapFn, 1)
+        local ok3, u96 = pcall(debug.getupvalue, noteSwapFn, 3)
+        if ok1 and ok3 and type(u96) == "table" and (Controller.tickCount - (tonumber(u95) or -99)) <= 1 then
+            local def = u96.item and Items.def(u96.item)
+            return Combat.strength(Controller.tickCount - (u96.reset or 0), def and def.speed or 4)
+        end
+    end
+    return Hands.strength(0)
+end
+
+local function isTargetShieldingFrom(eyePos, target)
+    local model = target.model
+    if model and model:GetAttribute("Using") == "shield" and model.PrimaryPart then
+        local toAttacker = eyePos * BLOCK - model.PrimaryPart.Position
+        local look = model.PrimaryPart.CFrame.LookVector
+        if Vector3.new(toAttacker.X, 0, toAttacker.Z):Dot(Vector3.new(look.X, 0, look.Z)) > 0 then
+            return true
+        end
+    end
+    return false
+end
+
+local function getBestAimPointAndAngles(eyePos, target)
+    local width  = target.width  or Config.WIDTH
+    local height = target.height or Config.HEIGHT
+    local halfW  = (width * 0.5) * 0.80
+    local minB = Vector3.new(target.feet.X - halfW, target.feet.Y + 0.08, target.feet.Z - halfW)
+    local maxB = Vector3.new(target.feet.X + halfW, target.feet.Y + height - 0.08, target.feet.Z + halfW)
+    local closestPt = Vector3.new(
+        math.clamp(eyePos.X, minB.X, maxB.X),
+        math.clamp(eyePos.Y, minB.Y, maxB.Y),
+        math.clamp(eyePos.Z, minB.Z, maxB.Z)
+    )
+    local centerPt = target.feet + Vector3.new(0, height * 0.5, 0)
+    local aimPt    = closestPt:Lerp(centerPt, 0.25)
+    local delta    = aimPt - eyePos
+    if delta.Magnitude < 1e-5 then return Controller.look(), Controller.yaw, Controller.pitch end
+    local u = delta.Unit
+    local yaw   = math.atan2(-u.X, -u.Z)
+    local pitch = math.asin(math.clamp(u.Y, -0.999, 0.999))
+    return u, yaw, pitch
+end
+
+local function getClosestTarget(maxReach, fovDeg)
+    local state = Controller.state
+    local eye   = Controller.eye()
+    if not state or not eye then return nil end
+    local myLook  = Controller.look()
+    local cosHalf = math.cos(math.rad((fovDeg or 360) * 0.5))
+    local best, bestDist = nil, maxReach
+
+    for _, t in ipairs(World.targets()) do
+        local isDummy = (World.folder and World.folder.Dummies and t.model.Parent == World.folder.Dummies)
+        if not CFG.TargetDummies and isDummy then
+            continue
+        end
+
+        local aimDir = getBestAimPointAndAngles(eye, t)
+        if (fovDeg or 360) >= 359 or myLook:Dot(aimDir) >= cosHalf then
+            local hitDist = origRayBox(eye, aimDir, t.feet, t.height, 0, t.width)
+            if hitDist and hitDist <= bestDist then
+                local wall = World.blockRay(eye, aimDir, hitDist, {"Solid"})
+                local web = World.blockRay(eye, aimDir, 4.5, {"Webs"})
+                local webBlocked = (web ~= nil and web.dist <= hitDist)
+                if (not wall or wall.dist >= hitDist) and not webBlocked then
+                    best, bestDist = t, hitDist
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function saveCamera()
+    if State.SavedYaw == nil then
+        State.SavedYaw   = Controller.yaw
+        State.SavedPitch = Controller.pitch
+    end
+end
+
+local function restoreCamera()
+    if State.SavedYaw ~= nil then
+        Controller.yaw   = State.SavedYaw
+        Controller.pitch = State.SavedPitch
+        State.SavedYaw   = nil
+        State.SavedPitch = nil
+    end
+end
+
+local function stopCombo(msg)
+    restoreCamera()
+    State.Active      = false
+    State.Stage       = "idle"
+    State.StageTick   = 0
+    State.Target      = nil
+    State.TargetName  = ""
+    State.LastDist    = math.huge
+    if msg then
+        State.LastResult = msg
+        log("Stopped: " .. msg)
+    end
+    if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+end
+
+-------------------------------------------------------------------------------
+-- Native attack queue
+-------------------------------------------------------------------------------
+local function queueNativeAttack(target, forceMaceSmash, noSilentRotate)
+    local state = Controller.state
+    local eye = Controller.eye()
+    if not state or not eye or not target or not u116_queue then return false end
+    if not forceMaceSmash and Hands.using and Hands.using.kind == "eat" then return false end
+
+    if forceMaceSmash then
+        if Controller.tickCount - lastMaceSmashTick < 6 then return false end
+    else
+        if Controller.tickCount - lastAutoAttackTick < 3 then return false end
+    end
+
+    local aimLook, aimYaw, aimPitch = Controller.look(), Controller.yaw, Controller.pitch
+    if not noSilentRotate and (CFG.MaceSilentAim) then
+        aimLook, aimYaw, aimPitch = getBestAimPointAndAngles(eye, target)
+    end
+
+    local shielded = isTargetShieldingFrom(eye, target)
+    if not forceMaceSmash and not shielded and CFG.SwordIFrameSync then
+        if getTargetHurtRemaining(target) > 0 then return false end
+    end
+
+    local origSlot = Hands.inv.selected
+    local chosenSlot = origSlot
+    local origHeld = Hands.held()
+    local origDef = origHeld and Items.def(origHeld)
+    local usedBreachSwap = false
+
+    if shielded and CFG.AutoShieldBreak then
+        local axeSlot = getBestAxeSlot()
+        if axeSlot then chosenSlot = axeSlot end
+    elseif forceMaceSmash then
+        local effFall = CFG.MaceFallSpoof and math.max(state.fallDistance, CFG.MaceSpoofHeight) or state.fallDistance
+        local maceSlot = getBestMaceSlot(effFall)
+        if maceSlot then chosenSlot = maceSlot end
+    end
+
+    if Hands.using and Hands.using.kind == "shield" then
+        pcall(Hands.stopUsing, false)
+    end
+
+    if not forceMaceSmash then
+        local effCharge = getEffectiveAttackStrength()
+        if effCharge < (tonumber(CFG.KillAuraMinCharge) or 0.90) then return false end
+    end
+
+    if chosenSlot ~= origSlot then
+        u116_queue.select = chosenSlot
+        if usedBreachSwap then
+            pendingRestoreSlot = origSlot
+            pendingRestoreTick = Controller.tickCount + 1
+        elseif forceMaceSmash and CFG.MaceAutoReturnSword then
+            pendingRestoreSlot = getBestSwordSlot() or origSlot
+            pendingRestoreTick = Controller.tickCount + 1
+        elseif shielded and CFG.AutoShieldBreak then
+            pendingRestoreSlot = getBestSwordSlot() or origSlot
+            pendingRestoreTick = Controller.tickCount + 1
+        end
+        -- Only skip the attack tick when 1-tick-swap is explicitly disabled
+        if forceMaceSmash and not CFG.Mace1TickSwap then
+            return true
+        end
+    end
+
+    -- Apply fall spoof unconditionally for mace smash
+    if forceMaceSmash and CFG.MaceFallSpoof then
+        state.fallDistance = math.max(state.fallDistance, CFG.MaceSpoofHeight)
+        state.onGround = false
+        state.gliding = false
+    end
+
+    if not noSilentRotate and (CFG.MaceSilentAim) then
+        if savedYaw == nil then
+            savedYaw = Controller.yaw
+            savedPitch = Controller.pitch
+        end
+        Controller.yaw = aimYaw
+        Controller.pitch = aimPitch
+    end
+
+    u116_queue.attacks = 1
+    if u224_targets then
+        table.clear(u224_targets)
+        table.insert(u224_targets, { look = Controller.look(), target = target })
+    end
+
+    recordLMB()
+    lastSwordTarget = target
+    lastSwordTargetAt = os.clock()
+    lastAutoAttackTick = Controller.tickCount
+    if forceMaceSmash then lastMaceSmashTick = Controller.tickCount end
+    return true
+end
+
+-------------------------------------------------------------------------------
+-- Combo state machine
+-------------------------------------------------------------------------------
+local function onPreTick(state)
+    if State.JumpReleaseTick and Controller.tickCount >= State.JumpReleaseTick then
+        pcall(Input.setVirtual, "jump", false)
+        State.JumpReleaseTick = nil
+    end
+
+    if not State.Active then return end
+    if not u116_queue then stopCombo("Queue lost") return end
+    if not state or not isAlive() then stopCombo("Not alive") return end
+
+    if pendingRestoreSlot and Controller.tickCount >= pendingRestoreTick and u116_queue then
+        if not u116_queue.select and Hands.inv.selected ~= pendingRestoreSlot then
+            u116_queue.select = pendingRestoreSlot
+        end
+        pendingRestoreSlot = nil
+    end
+
+    State.StageTick = State.StageTick + 1
+    local tick = State.StageTick
+
+    if State.Stage == "idle" then
+        local target = getClosestTarget(CFG.Range, 360)
+        if not target then
+            stopCombo("No target found")
+            return
+        end
+        State.Target      = target
+        State.TargetName  = tostring(target.model:GetAttribute("DisplayName") or target.model.Name)
+        State.LastResult  = ""
+        saveCamera()
+        State.Stage       = "wc_equip"
+        State.StageTick   = 0
+        log("Target acquired: " .. State.TargetName)
+
+    elseif State.Stage == "wc_equip" then
+        local wcSlot = findWindChargeSlot()
+        if not wcSlot then stopCombo("No wind charge") return end
+        local cd = Hands.cooldownFraction("wind_charge")
+        if cd and cd > 0 then
+            if tick > 60 then stopCombo("WC cooldown timeout") end
+            return
+        end
+
+        if state.onGround then
+            pcall(Input.setVirtual, "jump", true)
+            State.JumpReleaseTick = Controller.tickCount + 1
+        end
+
+        u116_queue.select  = wcSlot
+        Controller.pitch   = CFG.LookDownPitch
+        u116_queue.attacks = 0
+        if u224_targets then table.clear(u224_targets) end
+        u116_queue.uses    = 1
+        State.Stage        = "wc_wait"
+        State.StageTick    = 0
+        log("Used wind charge")
+
+    elseif State.Stage == "wc_wait" then
+        if not State.Target or not isTargetAlive(State.Target) then
+            stopCombo("Target died") return
+        end
+        if tick >= CFG.WcWaitTicks then
+            State.Stage     = "spear_equip"
+            State.StageTick = 0
+        end
+
+    elseif State.Stage == "spear_equip" then
+        if not State.Target or not isTargetAlive(State.Target) then
+            stopCombo("Target died") return
+        end
+        local live = findLiveTarget(State.Target.model)
+        if live then State.Target = live end
+
+        local spearSlot = getAnySpearSlot()
+        if not spearSlot then stopCombo("No spear") return end
+
+        if getEffectiveAttackStrength() < 1 then
+            if tick > 60 then stopCombo("Spear cooldown timeout") end
+            return
+        end
+
+        if Hands.using and Hands.using.kind == "shield" then
+            pcall(Hands.stopUsing, false)
+        end
+
+        local eye = Controller.eye()
+        if eye then
+            local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
+            Controller.yaw = aimYaw
+            Controller.pitch = aimPitch
+        end
+
+        u116_queue.select  = spearSlot
+        u116_queue.attacks = 1
+        if u224_targets then
+            table.clear(u224_targets)
+            table.insert(u224_targets, { look = Controller.look(), target = State.Target })
+        end
+        State.Stage     = "spear_wait"
+        State.StageTick = 0
+        log("Lunged with spear")
+
+    elseif State.Stage == "spear_wait" then
+        if not State.Target or not isTargetAlive(State.Target) then
+            stopCombo("Target died") return
+        end
+        local eye = Controller.eye()
+        if eye then
+            local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
+            Controller.yaw = aimYaw
+            Controller.pitch = aimPitch
+        end
+        if tick >= CFG.SpearWaitTicks then
+            State.Stage     = "mace_equip"
+            State.StageTick = 0
+        end
+
+    elseif State.Stage == "mace_equip" then
+        local maceSlot = getBestMaceSlot(state.fallDistance or 0)
+        if not maceSlot then stopCombo("No mace") return end
+        u116_queue.select    = maceSlot
+        State.Stage          = "mace_attack"
+        State.StageTick      = 0
+        State.LastAttackTick = 0
+        log("Equipped mace, starting auto-attack loop")
+
+    elseif State.Stage == "mace_attack" then
+        if not State.Target or not isTargetAlive(State.Target) then
+            stopCombo("Target died") return
+        end
+        local live = findLiveTarget(State.Target.model)
+        if live then State.Target = live end
+
+        -- Lock camera
+        local eye = Controller.eye()
+        if eye then
+            local _, aimYaw, aimPitch = getBestAimPointAndAngles(eye, State.Target)
+            Controller.yaw = aimYaw
+            Controller.pitch = aimPitch
+        end
+
+        -- Auto-attack exactly every 1.0 seconds (20 ticks @ 20 TPS)
+        if Controller.tickCount - State.LastAttackTick >= (CFG.AttackInterval or 20) then
+            if queueNativeAttack(State.Target, true, false) then
+                State.LastAttackTick = Controller.tickCount
+                log("Mace auto-attack fired")
+            end
+        end
+    end
+
+    if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+end
+
+local function onPostTick(state)
+    if savedYaw ~= nil and savedPitch ~= nil then
+        Controller.yaw = savedYaw
+        Controller.pitch = savedPitch
+        savedYaw = nil
+        savedPitch = nil
+    end
+end
+
+-- Clean up previous instance
+if _G.__SPEAR_MACE_LAST then
+    local prev = _G.__SPEAR_MACE_LAST
+    pcall(function()
+        for i = #Controller.beforeTick, 1, -1 do
+            if Controller.beforeTick[i] == prev.onPreTick then
+                table.remove(Controller.beforeTick, i)
+            end
+        end
+        for i = #Controller.onTick, 1, -1 do
+            if Controller.onTick[i] == prev.onPostTick then
+                table.remove(Controller.onTick, i)
+            end
+        end
+    end)
+    pcall(function() if prev.gui then prev.gui:Destroy() end end)
+end
+_G.__SPEAR_MACE_LAST = { onPreTick = onPreTick, onPostTick = onPostTick }
+table.insert(Controller.beforeTick, 1, onPreTick)
+table.insert(Controller.onTick, onPostTick)
+
+-------------------------------------------------------------------------------
+-- Action / Start function
+-------------------------------------------------------------------------------
+local function startCombo()
+    if State.Active then
+        stopCombo("Cancelled")
+        return
+    end
+
+    if not u116_queue then State.LastResult = "Queue not found" return end
+    if not findWindChargeSlot() then State.LastResult = "No wind charge in hotbar" return end
+    if not getAnySpearSlot() then State.LastResult = "No spear in hotbar" return end
+    if not getBestMaceSlot(0) then State.LastResult = "No mace in hotbar" return end
+
+    State.Active        = true
+    State.Stage         = "idle"
+    State.StageTick     = 0
+    State.LastResult    = "Searching..."
+    log("Combo Started")
+    if GUI and GUI.UpdateStatus then GUI.UpdateStatus() end
+end
+
+-------------------------------------------------------------------------------
+-- GUI
+-------------------------------------------------------------------------------
+local Accent   = Color3.fromRGB(90, 180, 255)
+local Bg       = Color3.fromRGB(20, 20, 28)
+local Card     = Color3.fromRGB(30, 30, 42)
+local Fg       = Color3.fromRGB(240, 240, 250)
+local Dim      = Color3.fromRGB(140, 140, 160)
+local Off      = Color3.fromRGB(55, 55, 75)
+local Warn     = Color3.fromRGB(255, 200, 90)
+local Good     = Color3.fromRGB(90, 220, 130)
+local Red      = Color3.fromRGB(220, 70, 80)
+
+local function guiContainer()
+    if typeof(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then return hui end
+    end
+    local ok, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok and core then return core end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name           = "SpearMaceComboGUI"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder   = 100
+ScreenGui.Parent         = guiContainer()
+_G.__SPEAR_MACE_LAST.gui = ScreenGui
+
+local Main = Instance.new("Frame")
+Main.Size             = UDim2.fromOffset(280, 250)
+Main.Position         = UDim2.new(0, 20, 0.5, -125)
+Main.BackgroundColor3 = Bg
+Main.BorderSizePixel  = 0
+Main.Active           = true
+Main.Parent           = ScreenGui
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 8)
+
+local Stroke = Instance.new("UIStroke", Main)
+Stroke.Color     = Accent
+Stroke.Thickness = 1.2
+
+local TitleBar = Instance.new("Frame")
+TitleBar.Size             = UDim2.new(1, 0, 0, 34)
+TitleBar.BackgroundColor3 = Card
+TitleBar.BorderSizePixel  = 0
+TitleBar.Parent           = Main
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 8)
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size                   = UDim2.new(1, -50, 1, 0)
+TitleText.Position               = UDim2.fromOffset(12, 0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text                   = "Spear-Mace Combo"
+TitleText.TextColor3             = Fg
+TitleText.Font                   = Enum.Font.GothamBold
+TitleText.TextSize               = 13
+TitleText.TextXAlignment         = Enum.TextXAlignment.Left
+TitleText.Parent                 = TitleBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size             = UDim2.fromOffset(22, 22)
+CloseBtn.Position         = UDim2.new(1, -28, 0, 6)
+CloseBtn.BackgroundColor3 = Red
+CloseBtn.Text             = "X"
+CloseBtn.TextColor3       = Fg
+CloseBtn.Font             = Enum.Font.GothamBold
+CloseBtn.TextSize         = 11
+CloseBtn.AutoButtonColor  = false
+CloseBtn.BorderSizePixel  = 0
+CloseBtn.Parent           = TitleBar
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+
+local StatusFrame = Instance.new("Frame")
+StatusFrame.Size             = UDim2.new(1, -16, 0, 62)
+StatusFrame.Position         = UDim2.fromOffset(8, 42)
+StatusFrame.BackgroundColor3 = Card
+StatusFrame.BorderSizePixel  = 0
+StatusFrame.Parent           = Main
+Instance.new("UICorner", StatusFrame).CornerRadius = UDim.new(0, 6)
+
+local StageLbl = Instance.new("TextLabel")
+StageLbl.Size                   = UDim2.new(1, -16, 0, 20)
+StageLbl.Position               = UDim2.fromOffset(8, 6)
+StageLbl.BackgroundTransparency = 1
+StageLbl.Text                   = "Ready"
+StageLbl.TextColor3             = Fg
+StageLbl.Font                   = Enum.Font.GothamBold
+StageLbl.TextSize               = 13
+StageLbl.TextXAlignment         = Enum.TextXAlignment.Left
+StageLbl.Parent                 = StatusFrame
+
+local SubLbl = Instance.new("TextLabel")
+SubLbl.Size                   = UDim2.new(1, -16, 0, 16)
+SubLbl.Position               = UDim2.fromOffset(8, 26)
+SubLbl.BackgroundTransparency = 1
+SubLbl.Text                   = "G to start"
+SubLbl.TextColor3             = Dim
+SubLbl.Font                   = Enum.Font.Gotham
+SubLbl.TextSize               = 11
+SubLbl.TextXAlignment         = Enum.TextXAlignment.Left
+SubLbl.Parent                 = StatusFrame
+
+local TargetLbl = Instance.new("TextLabel")
+TargetLbl.Size                   = UDim2.new(1, -16, 0, 16)
+TargetLbl.Position               = UDim2.fromOffset(8, 42)
+TargetLbl.BackgroundTransparency = 1
+TargetLbl.Text                   = ""
+TargetLbl.TextColor3             = Accent
+TargetLbl.Font                   = Enum.Font.Code
+TargetLbl.TextSize               = 11
+TargetLbl.TextXAlignment         = Enum.TextXAlignment.Left
+TargetLbl.Parent                 = StatusFrame
+
+local StartBtn = Instance.new("TextButton")
+StartBtn.Size             = UDim2.new(1, -16, 0, 46)
+StartBtn.Position         = UDim2.fromOffset(8, 112)
+StartBtn.BackgroundColor3 = Accent
+StartBtn.Text             = "START COMBO  [G]"
+StartBtn.TextColor3       = Color3.fromRGB(15, 15, 20)
+StartBtn.Font             = Enum.Font.GothamBold
+StartBtn.TextSize         = 14
+StartBtn.AutoButtonColor  = false
+StartBtn.BorderSizePixel  = 0
+StartBtn.Parent           = Main
+Instance.new("UICorner", StartBtn).CornerRadius = UDim.new(0, 6)
+
+local RangeFrame = Instance.new("Frame")
+RangeFrame.Size             = UDim2.new(1, -16, 0, 40)
+RangeFrame.Position         = UDim2.fromOffset(8, 168)
+RangeFrame.BackgroundColor3 = Card
+RangeFrame.BorderSizePixel  = 0
+RangeFrame.Parent           = Main
+Instance.new("UICorner", RangeFrame).CornerRadius = UDim.new(0, 5)
+
+local RangeLbl = Instance.new("TextLabel")
+RangeLbl.Size                   = UDim2.new(1, -80, 0, 16)
+RangeLbl.Position               = UDim2.fromOffset(8, 4)
+RangeLbl.BackgroundTransparency = 1
+RangeLbl.Text                   = "Range"
+RangeLbl.TextColor3             = Fg
+RangeLbl.Font                   = Enum.Font.GothamBold
+RangeLbl.TextSize               = 11
+RangeLbl.TextXAlignment         = Enum.TextXAlignment.Left
+RangeLbl.Parent                 = RangeFrame
+
+local RangeVal = Instance.new("TextLabel")
+RangeVal.Size                   = UDim2.fromOffset(60, 16)
+RangeVal.Position               = UDim2.new(1, -68, 0, 4)
+RangeVal.BackgroundTransparency = 1
+RangeVal.Text                   = tostring(CFG.Range)
+RangeVal.TextColor3             = Accent
+RangeVal.Font                   = Enum.Font.GothamBold
+RangeVal.TextSize               = 11
+RangeVal.TextXAlignment         = Enum.TextXAlignment.Right
+RangeVal.Parent                 = RangeFrame
+
+local RangeTrack = Instance.new("TextButton")
+RangeTrack.Size             = UDim2.new(1, -16, 0, 8)
+RangeTrack.Position         = UDim2.fromOffset(8, 26)
+RangeTrack.BackgroundColor3 = Off
+RangeTrack.Text             = ""
+RangeTrack.AutoButtonColor  = false
+RangeTrack.BorderSizePixel  = 0
+RangeTrack.Parent           = RangeFrame
+Instance.new("UICorner", RangeTrack).CornerRadius = UDim.new(1, 0)
+
+local RangeFill = Instance.new("Frame")
+RangeFill.Size             = UDim2.new((CFG.Range - 5) / 75, 0, 1, 0)
+RangeFill.BackgroundColor3 = Accent
+RangeFill.BorderSizePixel  = 0
+RangeFill.Parent           = RangeTrack
+Instance.new("UICorner", RangeFill).CornerRadius = UDim.new(1, 0)
+
+local rangeDrag = false
+local function setRange(v)
+    v = math.clamp(v, 5, 80)
+    CFG.Range = v
+    RangeFill.Size = UDim2.new((v - 5) / 75, 0, 1, 0)
+    RangeVal.Text = string.format("%d", v)
+end
+RangeTrack.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        rangeDrag = true
+        setRange(5 + ((input.Position.X - RangeTrack.AbsolutePosition.X) / RangeTrack.AbsoluteSize.X) * 75)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if rangeDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        setRange(5 + ((input.Position.X - RangeTrack.AbsolutePosition.X) / RangeTrack.AbsoluteSize.X) * 75)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        rangeDrag = false
+    end
+end)
+
+local Hint = Instance.new("TextLabel")
+Hint.Size                   = UDim2.new(1, -16, 0, 16)
+Hint.Position               = UDim2.new(0, 8, 1, -22)
+Hint.BackgroundTransparency = 1
+Hint.Text                   = "Drag title bar to move"
+Hint.TextColor3             = Dim
+Hint.Font                   = Enum.Font.Gotham
+Hint.TextSize               = 10
+Hint.TextXAlignment         = Enum.TextXAlignment.Center
+Hint.Parent                 = Main
+
+local dragging, dragStart, startPos = false, nil, nil
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging  = true
+        dragStart = input.Position
+        startPos  = Main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local delta = input.Position - dragStart
+    Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end)
+
+local Pill = Instance.new("TextButton")
+Pill.Name             = "Reopen"
+Pill.Size             = UDim2.fromOffset(130, 26)
+Pill.Position         = UDim2.new(0, 16, 0, 16)
+Pill.BackgroundColor3 = Accent
+Pill.Text             = "SpearMace (show)"
+Pill.TextColor3       = Fg
+Pill.Font             = Enum.Font.GothamBold
+Pill.TextSize         = 11
+Pill.AutoButtonColor  = false
+Pill.BorderSizePixel  = 0
+Pill.Visible          = false
+Pill.Parent           = ScreenGui
+Instance.new("UICorner", Pill).CornerRadius = UDim.new(0, 6)
+
+Pill.MouseButton1Click:Connect(function() Main.Visible = true; Pill.Visible = false end)
+CloseBtn.MouseButton1Click:Connect(function() Main.Visible = false; Pill.Visible = true end)
+
+GUI = {}
+function GUI.UpdateStatus()
+    local stage = State.Stage
+    if not State.Active then
+        StageLbl.Text = "Ready"
+        StageLbl.TextColor3 = Fg
+    else
+        StageLbl.TextColor3 = Accent
+        if stage == "idle" then
+            StageLbl.Text = "Searching..."
+        elseif stage == "wc_equip" then
+            StageLbl.Text = "Wind charge"
+        elseif stage == "wc_wait" then
+            StageLbl.Text = "Wind charge launched"
+        elseif stage == "spear_equip" then
+            StageLbl.Text = "Equipping Spear"
+        elseif stage == "spear_wait" then
+            StageLbl.Text = "Spear Lunged"
+        elseif stage == "mace_equip" then
+            StageLbl.Text = "Mace Equipped"
+        elseif stage == "mace_attack" then
+            StageLbl.Text = "Auto Attack (1.0s)"
+        end
+    end
+
+    if State.LastResult ~= "" then
+        SubLbl.Text = State.LastResult
+        SubLbl.TextColor3 = (State.LastResult == "Combo complete" or State.LastResult == "Cancelled") and Good or Warn
+    else
+        SubLbl.Text = State.Active and "Running…" or "G to start"
+        SubLbl.TextColor3 = Dim
+    end
+
+    if State.TargetName ~= "" and State.Active then
+        TargetLbl.Text = "Target: " .. State.TargetName
+    else
+        TargetLbl.Text = ""
+    end
+
+    if State.Active then
+        StartBtn.Text = "STOP COMBO  [G]"
+        StartBtn.BackgroundColor3 = Red
+        StartBtn.TextColor3 = Fg
+    else
+        StartBtn.Text = "START COMBO  [G]"
+        StartBtn.BackgroundColor3 = Accent
+        StartBtn.TextColor3 = Color3.fromRGB(15, 15, 20)
+    end
+end
+
+StartBtn.MouseButton1Click:Connect(startCombo)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == CFG.ActivateKey then
+        startCombo()
+    end
+end)
+
+GUI.UpdateStatus()
+print("[SpearMaceCombo] Loaded — queue:" .. tostring(u116_queue ~= nil) .. " targets:" .. tostring(u224_targets ~= nil))
